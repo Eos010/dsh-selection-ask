@@ -22,6 +22,15 @@
   "use strict";
 
   var PACKAGE_ID = "dsh-selection-ask";
+  /** 宿主半边提供的流式问答端点（见 index.mjs）。 */
+  var ASK_ENDPOINT = "/plugins/dsh-selection-ask/ask";
+  /**
+   * 注册进输入框触发器管道的「引用源」名字。
+   *
+   * 它是胶囊与模型文本之间的路由键：胶囊里存的 `ref` 靠它找回我的 codec，
+   * 发送时由 codec 把编号展开成引用块原文。
+   */
+  var REF_SOURCE = "selection";
   /**
    * 样式。占位符由 `build.mjs` 换成 `selection-ask.css` 的正文（JSON 字符串字面量）——
    * **不要手改这一行**：改样式改 `selection-ask.css`，然后 `node build.mjs`。
@@ -45,14 +54,57 @@
       quoted: "已引用",
       truncated: "内容过长，已截断",
       unavailable: "拿不到输入框（插件未生效）",
-      aria: "把选中的文本引用到输入框"
+      aria: "把选中的文本引用到输入框",
+      /** 胶囊上显示的编号前缀 —— 对应参考图的「选中文本 1」。 */
+      chipPrefix: "选中文本",
+      /** 就地输入栏的占位文案（参考图的「输入你的评论…」）。 */
+      annotate: "输入你的批注，或直接引用…",
+      commit: "引用",
+      commitAria: "把这段和批注一起加进输入框",
+      askAriaSide: "在右侧栏就这段内容单独提问",
+      ask: "侧边提问",
+      askAria: "在右侧栏开一个独立对话，就这段内容提问",      askFailed: "侧边栏不可用，无法开侧边对话",
+      sideTitle: "侧边提问",
+      quoteLabel: "引用的原文",
+      expand: "展开",
+      collapse: "收起",
+      placeholder: "就这段内容提问…（Enter 发送，Shift+Enter 换行）",
+      send: "发送",
+      stop: "停止",
+      clear: "清空",
+      thinking: "思考中…",
+      assistant: "回答",
+      you: "你",
+      empty: "选中一段文字、点「侧边提问」，答案会出现在这里，不会进主对话。",
+      failed: "出错了"
     },
     en: {
       quote: "Add to conversation",
       quoted: "Added",
       truncated: "Selection truncated",
       unavailable: "Composer unavailable",
-      aria: "Quote the selected text into the composer"
+      aria: "Quote the selected text into the composer",
+      chipPrefix: "Selection",
+      annotate: "Add a note, or just quote…",
+      commit: "Quote",
+      commitAria: "Add this passage and your note to the composer",
+      askAriaSide: "Ask about this passage in a separate side conversation",
+      ask: "Ask aside",
+      askAria: "Open a separate side conversation about this passage",
+      askFailed: "Sidebar unavailable — cannot open the side conversation",
+      sideTitle: "Ask aside",
+      quoteLabel: "Quoted passage",
+      expand: "Expand",
+      collapse: "Collapse",
+      placeholder: "Ask about this passage… (Enter to send, Shift+Enter for a newline)",
+      send: "Send",
+      stop: "Stop",
+      clear: "Clear",
+      thinking: "Thinking…",
+      assistant: "Answer",
+      you: "You",
+      empty: "Select a passage and click \"Ask aside\" — the answer shows up here and never enters the main conversation.",
+      failed: "Something went wrong"
     }
   };
 
@@ -185,6 +237,12 @@
     }
   }
 
+  /** 焦点是不是在我们自己画的浮层里。 */
+  function ownOverlayHasFocus() {
+    var active = typeof document !== "undefined" ? document.activeElement : null;
+    return !!(active && active.closest && active.closest("[" + OWN_ATTR + "]"));
+  }
+
   /**
    * 读当前选区；不满足浮层条件时返回 null。
    *
@@ -281,6 +339,23 @@
     ]);
   }
 
+  /** 侧边对话图标：一个方框右上角挑出一个气泡。 */
+  function askIcon(h) {
+    return h("svg", {
+      className: "dsa-ico",
+      viewBox: "0 0 16 16",
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: 1.5,
+      strokeLinecap: "round",
+      strokeLinejoin: "round",
+      "aria-hidden": "true"
+    }, [
+      h("rect", { key: "a", x: 1.8, y: 2.6, width: 8.6, height: 9.6, rx: 1.6 }),
+      h("path", { key: "b", d: "M13.2 5.6h1v6.4l-2.1-1.6" })
+    ]);
+  }
+
   /* ──────────────────────────── 插件体 ──────────────────────────── */
 
   /**
@@ -325,6 +400,160 @@
             if (styleNode.parentElement) styleNode.parentElement.removeChild(styleNode);
           };
         }, PACKAGE_ID + ": styles");
+      }
+
+      /* ---------- 引用登记处：编号就是身份 ---------- */
+      /**
+       * 编号在**一个页面生命周期内全局递增**（选中文本 1、2、3…）——
+       * 参考图里就是这个语义。
+       *
+       * 同一段文字被再次引用时**复用原来的编号**：同一处标注不该有两个号，
+       * 否则原文上的高亮会出现两个圆标指着同一句话。
+       */
+      var quoteSeq = 0;
+      var quoteByRef = new Map();
+      var quoteByText = new Map();
+
+      /** 给一段原文分配（或取回）它的编号记录。 */
+      function registerQuote(text) {
+        var existing = quoteByText.get(text);
+        if (existing) return existing;
+        quoteSeq += 1;
+        var record = { n: quoteSeq, text: text, ref: "q" + quoteSeq };
+        quoteByRef.set(record.ref, record);
+        quoteByText.set(text, record);
+        return record;
+      }
+
+      /** 胶囊上的字。 */
+      function chipLabel(record) {
+        return T.chipPrefix + " " + record.n;
+      }
+
+      /* ---------- 输入框的「引用源」：胶囊 ↔ 模型文本 ---------- */
+      /**
+       * 这里借的是 DSH 官方的**原子引用胶囊**机制（`@文件` 用的是同一套）：
+       * 注册一个源，源里的 `codec.serialize(ref)` 决定**发送时这条引用展开成什么文本**。
+       * 所以胶囊只是**显示形态**变了 —— 模型收到的仍然是 `> 引用原文`。
+       *
+       * 惰性注册：不在 `apply()` 里做，避免为它多声明一个 inject。
+       */
+      var referenceSourceReady = false;
+      function ensureReferenceSource() {
+        if (referenceSourceReady) return true;
+        var triggers = null;
+        try { triggers = ctx.get ? ctx.get("inputTriggers") : null; } catch (error) { triggers = null; }
+        if (!triggers || typeof triggers.registerSource !== "function") return false;
+        try {
+          var dispose = triggers.registerSource({
+            trigger: "@",
+            name: REF_SOURCE,
+            showGroupTitle: false,
+            // 本插件不进 `@` 补全菜单：候选恒空，只是借这条管道插胶囊。
+            candidates: function () { return []; },
+            onPick: function () { return undefined; },
+            codec: {
+              clipboardText: function (ref) {
+                var record = quoteByRef.get(ref);
+                return record ? quoteMarkdown(record.text) : ref;
+              },
+              serialize: function (ref) {
+                var record = quoteByRef.get(ref);
+                return Promise.resolve(record ? quoteMarkdown(record.text) : "");
+              }
+            }
+          });
+          ctx.effect(function () { return dispose; }, PACKAGE_ID + ": reference source");
+          referenceSourceReady = true;
+          return true;
+        } catch (error) {
+          console.error("[" + PACKAGE_ID + "] 注册引用源失败，胶囊会退回纯文本：", error);
+          return false;
+        }
+      }
+
+      /**
+       * 取会话作用域 —— 输入机的四个事件都挂在它上面。
+       *
+       * ⚠️ 这里有个坑（2026-10-11 实测踩到，症状是 `emit` 返回 undefined）：
+       * 输入机的监听**不是**挂在 `sessions.scope(id)` 上，而是挂在
+       * **会话绑定的 ctx** 上 —— `ui-conversation` 的 `shellFor(binding)` 里写的是
+       * `const { sessionId, session, ctx: actx } = binding`。用错那个，事件发出去
+       * 一个监听者都没有，而且**不会报错**，只会静默地"胶囊不出来"。
+       *
+       * 两个都返回，调用方按顺序试 —— 宿主版本换了也不会整个失灵。
+       *
+       * @returns {Array<{via: string, actx: object}>}
+       */
+      function sessionScopes(sessionId) {
+        var found = [];
+        var sessions = null;
+        try { sessions = ctx.get ? ctx.get("sessions") : null; } catch (error) { sessions = null; }
+        if (!sessions) return found;
+        try {
+          if (typeof sessions.binding === "function") {
+            var binding = sessions.binding(sessionId);
+            if (binding && binding.ctx && typeof binding.ctx.emit === "function") {
+              found.push({ via: "binding.ctx", actx: binding.ctx });
+            }
+          }
+        } catch (error) { /* 试下一个 */ }
+        try {
+          if (typeof sessions.scope === "function") {
+            var scoped = sessions.scope(sessionId);
+            if (scoped && typeof scoped.emit === "function" && !found.some(function (item) { return item.actx === scoped; })) {
+              found.push({ via: "sessions.scope", actx: scoped });
+            }
+          }
+        } catch (error) { /* 就那么几个候选 */ }
+        return found;
+      }
+
+      /**
+       * 往输入框插一个引用胶囊。
+       *
+       * @returns {string|null} **失败原因**（成功时 null）。故意返回原因而不是 false：
+       *   兜底退回纯文本是"看得见的行为降级"，必须能在控制台说清为什么 ——
+       *   否则这类问题只会表现成"胶囊有时候不出来"，无从查起。
+       */
+      function insertQuoteChip(record, sessionId, draft, draftRev) {
+        if (!ensureReferenceSource()) return "no-reference-source";
+        var candidates = sessionScopes(sessionId);
+        if (candidates.length === 0) return "no-session-scope";
+        var tried = [];
+        for (var index = 0; index < candidates.length; index += 1) {
+          var candidate = candidates[index];
+          // ⚠️ 必须用 `bail` 而不是 `emit`（2026-10-11 为此踩了一整轮）：
+          //    cordis 的 `emit` 只是"把监听器跑一遍"，**没有返回值**；
+          //    只有 `bail` 会"跑到第一个返回非空值的监听器为止，并把它返回"。
+          //    拿 `emit` 的返回值判成败 ⇒ 明明插进去了却判成失败 ⇒ 兜底的 setDraft
+          //    再把刚插好的胶囊整个替换掉。症状：胶囊**永远不出现**，只有纯文本，
+          //    而且控制台会显示 `not-accepted(undefined)` 这种看起来像"没人监听"的假象。
+          if (typeof candidate.actx.bail !== "function") {
+            tried.push(candidate.via + "=no-bail");
+            continue;
+          }
+          try {
+            var accepted = candidate.actx.bail("slash/input-insert-reference", {
+              reference: {
+                source: REF_SOURCE,
+                ref: record.ref,
+                label: chipLabel(record),
+                // ⚠️ DSH 只给三种 glyph（session / file / folder），没有"引用号"图标。
+                //    `session` 是那个对话气泡，是三种里最接近参考图的。
+                appearance: "session",
+                clipboardText: quoteMarkdown(record.text)
+              },
+              // 折叠 span：插在草稿末尾
+              span: { start: draft.length, end: draft.length, draftRev: draftRev }
+            });
+            if (accepted === true) return null;
+            tried.push(candidate.via + "=" + String(accepted));
+          } catch (error) {
+            tried.push(candidate.via + " threw " + String(error && error.message ? error.message : error));
+          }
+        }
+        return "not-accepted(" + tried.join(", ") + ")";
       }
 
       /* ---------- portal 宿主：一个挂在 body 上的固定层 ---------- */
@@ -378,14 +607,27 @@
         }, props.text);
       }
 
-      /* ---------- 浮层 ---------- */
+      /* ---------- 浮层：一条就地输入栏（参考图4） ---------- */
+      /**
+       * 浮层从"两个按钮"变成"**一个输入框 + 两个动作**"：
+       *
+       *   选中一段文字 → 光标旁直接出现输入栏 → 就地写批注 → 回车
+       *   → `[💬 选中文本 N] 你的批注` 一起落进主输入框（你可以接着改再发）。
+       *
+       * 不写批注直接回车也可以（那就只引用）。
+       */
       function Toolbar(props) {
         var selection = props.selection;
-        var onQuote = props.onQuote;
+        var onCommit = props.onCommit;
+        var onAsk = props.onAsk;
         var ref = React.useRef(null);
+        var inputRef = React.useRef(null);
         var posState = React.useState(null);
         var pos = posState[0];
         var setPos = posState[1];
+        var noteState = React.useState("");
+        var note = noteState[0];
+        var setNote = noteState[1];
 
         // 量一次再落位：浮层宽度取决于文案（中英文长度差很多），
         // 写死宽度会在另一种语言下偏出选区。
@@ -393,18 +635,38 @@
           var el = ref.current;
           if (!el || !selection) return;
           var rect = el.getBoundingClientRect();
-          var next = clampPosition(selection.anchor, {
+          setPos(clampPosition(selection.anchor, {
             width: rect.width,
             height: rect.height
           }, {
             width: window.innerWidth,
             height: window.innerHeight
+          }));
+        }, [selection]);
+
+        // 出现即聚焦：选中 → 直接打字，不该还要再点一下
+        React.useEffect(function () {
+          var node = inputRef.current;
+          if (!node || !selection) return;
+          var frame = window.requestAnimationFrame(function () {
+            try { node.focus({ preventScroll: true }); } catch (error) { /* 聚焦失败不影响 */ }
           });
-          // 探针放在 layout effect 里而不是 render 里：render 期间做副作用是错的。
-          setPos(next);
+          return function () { window.cancelAnimationFrame(frame); };
         }, [selection]);
 
         if (!selection) return null;
+
+        var commit = function (event) {
+          if (event) event.preventDefault();
+          onCommit(selection, note.trim());
+        };
+        var onKeyDown = function (event) {
+          if (event.key === "Escape") return;                       // 交给全局 Esc 收起
+          if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+          event.preventDefault();
+          commit();
+        };
+
         return h("div", {
           ref: ref,
           className: "dsa-root",
@@ -413,23 +675,47 @@
           style: pos
             ? { left: pos.left + "px", top: pos.top + "px" }
             : { left: "0px", top: "0px", visibility: "hidden" },
-          // 关键：不 preventDefault 的话，按下按钮会先把选区清掉，
+          // 关键：不 preventDefault 的话，按下浮层会先把选区清掉，
           // 等 click 触发时选区已经没了（拿不到文本）。
           onMouseDown: function (event) { event.preventDefault(); }
         }, [
+          h("input", {
+            key: "note",
+            ref: inputRef,
+            type: "text",
+            className: "dsa-note",
+            "data-dsa": "note",
+            placeholder: T.annotate,
+            value: note,
+            onChange: function (event) { setNote(event.target.value); },
+            onKeyDown: onKeyDown,
+            // 输入框自己要能接收鼠标：父级的 preventDefault 对它是多余的
+            onMouseDown: function (event) { event.stopPropagation(); }
+          }),
           h("button", {
-            key: "quote",
+            key: "commit",
             type: "button",
-            className: "dsa-btn",
+            className: "dsa-btn dsa-btn--icon",
             "data-dsa": "quote",
-            title: T.aria,
-            "aria-label": T.aria,
+            title: T.commitAria,
+            "aria-label": T.commitAria,
+            onMouseDown: function (event) { event.preventDefault(); },
+            onClick: commit
+          }, [quoteIcon(h), h("span", { key: "t" }, T.commit)]),
+          h("span", { key: "sep", className: "dsa-sep", "aria-hidden": "true" }),
+          h("button", {
+            key: "ask",
+            type: "button",
+            className: "dsa-btn dsa-btn--icon",
+            "data-dsa": "ask",
+            title: T.askAriaSide,
+            "aria-label": T.askAriaSide,
             onMouseDown: function (event) { event.preventDefault(); },
             onClick: function (event) {
               event.preventDefault();
-              onQuote(selection);
+              onAsk(selection, note.trim());
             }
-          }, [quoteIcon(h), h("span", { key: "t" }, T.quote)])
+          }, [askIcon(h), h("span", { key: "t" }, T.ask)])
         ]);
       }
 
@@ -440,15 +726,37 @@
         var [flash, setFlash] = React.useState(null);
         var inputActions = props ? props.inputActions : null;
         var useInput = props ? props.useInput : null;
+        var sessionId = props ? props.sessionId : undefined;
         // 草稿通过会话标准属性读；拿不到就当空草稿（引用仍会写进去，只是不追加）。
         var draft = useInput ? useInput(function (state) { return state.draft; }) : "";
+        // 修订号：插胶囊 / 插文本的 span 都要拿它做 CAS 校验，拿到旧值会被拒。
+        var draftRev = useInput ? useInput(function (state) { return state.draftRev; }) : 0;
+        /**
+         * 最新一版的草稿与修订号，**每次渲染都刷新**。
+         * 给"等胶囊落位"的那个 rAF 轮询用：它不能依赖闭包里的旧值。
+         */
+        var latestRef = React.useRef({ draft: "", draftRev: 0 });
+        latestRef.current = { draft: draft, draftRev: draftRev };
 
         React.useEffect(function () {
           var frame = 0;
           function flush() {
             frame = 0;
             var next = readSelection();
-            setSelection(next);
+            if (next) {
+              setSelection(next);
+              return;
+            }
+            // ⚠️ 空选区**不一定**该收起浮层。
+            //
+            // 就地输入栏出现时会自动聚焦，而"聚焦一个 input"会让浏览器把文档选区
+            // 清掉 —— 于是 selectionchange 立刻回报"没有选区了"，浮层在出现的同
+            // 一帧把自己收掉。实测症状：拖选之后浮层根本不出现。
+            //
+            // 判据：焦点在我们自己的 DOM 里时，就不许因为"没选区"而收起。
+            // 点别处仍然收起（那是 mousedown 那条路，见 onPointerDown）。
+            if (ownOverlayHasFocus()) return;
+            setSelection(null);
           }
           function schedule() {
             if (frame) return;
@@ -480,29 +788,135 @@
           };
         }, []);
 
-        var quote = React.useCallback(function (picked) {
-          var editor = findEditor(anchorRef.current);
+        /**
+         * 提交一次引用：**胶囊进输入框，批注跟在胶囊后面**。
+         *
+         * 两条路径，顺序不能反：
+         *  1. 主路径 —— 往输入框插一个原子胶囊（编号就是身份）。模型侧完全不变：
+         *     胶囊在发送时由 codec 展开成 `> 原文`。
+         *  2. 兜底 —— 胶囊插不进去（没有引用源 / 没有会话作用域 / 事件没人接）时，
+         *     退回原来的纯文本引用块，功能不消失。
+         *
+         * ⚠️ 批注**不能**用 `setDraft` 追加：草稿是**全文替换**语义，
+         *    调一次就会把刚插进去的胶囊整个抹掉。所以批注交给
+         *    re-render 之后的 effect，用「插入文本」事件接在胶囊后面。
+         */
+        var commit = React.useCallback(function (picked, note) {
           var block = quoteMarkdown(picked.text);
           if (block === "") return;
           setSelection(null);
-          if (!inputActions || typeof inputActions.setDraft !== "function") {
-            console.error("[" + PACKAGE_ID + "] 插槽没有给出 inputActions.setDraft，无法写进输入框。");
-            return;
+          var editor = findEditor(anchorRef.current);
+          var record = registerQuote(picked.text);
+
+          var chipError = insertQuoteChip(record, sessionId, draft, draftRev);
+          var chipped = chipError === null;
+
+          if (!chipped) {
+            // 降级必须**出声**：这是一次看得见的行为变化，不是内部细节。
+            console.warn("[" + PACKAGE_ID + "] 胶囊插入未生效（" + chipError + "），退回纯文本引用。");
+            if (!inputActions || typeof inputActions.setDraft !== "function") {
+              console.error("[" + PACKAGE_ID + "] 插槽没有给出 inputActions.setDraft，无法写进输入框。");
+              return;
+            }
+            var fallback = note === "" ? block : block + "\n\n" + note;
+            try {
+              inputActions.setDraft(composeDraft(draft, fallback));
+            } catch (error) {
+              console.error("[" + PACKAGE_ID + "] 写入草稿失败：", error);
+              return;
+            }
+            // setDraft 之后光标位置由编辑器自己决定；这里把它推到末尾，
+            // 让"引用完接着写问题"这个动作不需要再用鼠标点一下。
+            window.requestAnimationFrame(function () { caretToEnd(editor); });
+          } else {
+            if (note !== "") appendNote(note, draft, record);
+            window.requestAnimationFrame(function () { caretToEnd(editor); });
           }
-          try {
-            inputActions.setDraft(composeDraft(draft, block));
-          } catch (error) {
-            console.error("[" + PACKAGE_ID + "] 写入草稿失败：", error);
-            return;
-          }
-          // setDraft 之后光标位置由编辑器自己决定；这里把它推到末尾，
-          // 让"引用完接着写问题"这个动作不需要再用鼠标点一下。
-          window.requestAnimationFrame(function () { caretToEnd(editor); });
-          setFlash(picked.truncated
-            ? { text: T.truncated + "（" + picked.text.length + " 字）", anchor: picked.anchor }
-            : { text: T.quoted, anchor: picked.anchor });
+
+          setFlash({
+            text: picked.truncated
+              ? T.truncated + "（" + picked.text.length + " 字）"
+              : (chipped ? chipLabel(record) : T.quoted),
+            anchor: picked.anchor
+          });
           window.setTimeout(function () { setFlash(null); }, FLASH_MS);
-        }, [draft, inputActions, T]);
+        }, [draft, draftRev, sessionId, inputActions, appendNote, T]);
+
+        /**
+         * 把批注接在胶囊后面。
+         *
+         * 这个动作**在胶囊落位之后**才能做：草稿是全文替换语义，先写批注再插胶囊
+         * 会把批注冲掉；而插胶囊会让草稿与修订号都变，所以必须等它变了再发。
+         *
+         * ⚠️ 两条踩出来的规矩（2026-10-11）：
+         *  1. **不用 `useEffect` 驱动。** effect 会在胶囊真正落位之前因为别的重渲染
+         *     先跑一次，拿旧修订号去发事件 —— span 的 CAS 过不去，而待办已经被消费掉，
+         *     于是永远不再重试。更阴的是 effect 的 cleanup 会在 `flash` 变化时
+         *     **静默取消**正在重试的 rAF，连告警都来不及打。所以改成从提交处直接起循环。
+         *  2. **判据是"事件被接下"（`bail` 返回 true），不是"草稿变了"。**
+         *     拿"草稿变了"当条件的话，一旦插胶囊没有改变 `useInput()` 报出来的投影
+         *     （完全可能：胶囊是 Lexical 的 decorator 节点），这个循环就永远等不到，
+         *     然后安静地放弃。改成"每帧都试着发一次，被接下就停"——CAS 自己会挑出
+         *     修订号对得上的那一帧。
+         */
+        var appendNote = React.useCallback(function (note, before, record) {
+          var scopes = sessionScopes(sessionId);
+          if (scopes.length === 0) {
+            console.warn("[" + PACKAGE_ID + "] 拿不到会话作用域，批注没能接在胶囊后面。");
+            return;
+          }
+          var actx = scopes[0].actx;
+          if (typeof actx.bail !== "function") {
+            console.warn("[" + PACKAGE_ID + "] 这个会话作用域没有 bail 派发，批注没能接上。");
+            return;
+          }
+          // 插入点有几个可能的坐标系，**逐个试**，让 `bail` 的返回值挑出对的那个：
+          //  · `InputState.draft` 是**剪贴板投影**（胶囊展开成 clipboardText）；
+          //  · 而 `insertText` 的 span 要的是**编辑坐标**，胶囊在那里的长度可能只算
+          //    它的 label（"选中文本 1"）。两者差 `clipLen - labelLen`。
+          //  与其猜，不如把候选都试一遍 —— 被接下的那个就是对的。
+          var delta = quoteMarkdown(record.text).length - chipLabel(record).length;
+          var attempt = function (tries) {
+            var now = latestRef.current;
+            var ends = [now.draft.length];
+            if (delta > 0 && now.draft.length >= delta) ends.push(now.draft.length - delta);
+            ends.push(before.length);
+            for (var index = 0; index < ends.length; index += 1) {
+              var end = ends[index];
+              if (end < 0 || end > now.draft.length) continue;
+              var accepted = false;
+              try {
+                accepted = actx.bail("slash/input-insert-text", {
+                  text: " " + note,
+                  span: { start: end, end: end, draftRev: now.draftRev }
+                }) === true;
+              } catch (error) {
+                console.error("[" + PACKAGE_ID + "] 批注没能接在胶囊后面：", error);
+                return;
+              }
+              if (accepted) return;
+            }
+            if (tries < 60) window.requestAnimationFrame(function () { attempt(tries + 1); });
+            else {
+              console.warn(
+                "[" + PACKAGE_ID + "] 批注始终没被输入机接下（草稿 " + before.length + " → " + now.draft.length
+                + "，候选插入点 " + JSON.stringify(ends) + "，delta " + delta + "）。"
+              );
+            }
+          };
+          window.requestAnimationFrame(function () { attempt(0); });
+        }, [sessionId]);
+
+        /**
+         * 「侧边提问」：把这段文本交给右侧栏的独立对话。
+         *
+         * 它**不写输入框**、也不碰主对话 —— 这正是与「引用到对话」的分工。
+         * 在就地输入栏里写了字的话，那段字成为侧边对话的**第一个问题**。
+         */
+        var ask = React.useCallback(function (picked, note) {
+          setSelection(null);
+          openAsk(picked, note);
+        }, [openAsk]);
 
         var anchor = h("span", {
           key: "anchor",
@@ -513,7 +927,7 @@
 
         var overlay = selection
           ? ReactDOM.createPortal(
-            h(Toolbar, { selection: selection, onQuote: quote }),
+            h(Toolbar, { selection: selection, onCommit: commit, onAsk: ask }),
             ensureHost()
           )
           : null;
@@ -526,6 +940,77 @@
         }
         return h(React.Fragment, null, anchor, overlay);
       }
+
+      /* ---------- 侧边提问：注册标签页类型与面板主体 ---------- */
+      var panel = createAskPanel({
+        React: React,
+        h: h,
+        T: T,
+        lang: lang,
+        quoteMarkdown: quoteMarkdown,
+        endpoint: ASK_ENDPOINT,
+        packageId: PACKAGE_ID
+      });
+
+      /** 取右侧栏控制器；拿不到就明说，不静默。 */
+      function sidebarRightService() {
+        try {
+          return ctx.get ? ctx.get("sidebarRight") : null;
+        } catch (error) {
+          return null;
+        }
+      }
+
+      /**
+       * 打开（或聚焦）侧边对话标签页，并把这段文本作为这一轮的引用。
+       *
+       * 同一个 kind 在同一个 pane 里会**去重**：再次调用不会开第二个标签页，
+       * 而是聚焦原来那个、把新引用通过 `navigation.params` 递进去
+       * （面板据此重开一轮对话）。这正是我们要的语义。
+       */
+      function openAsk(picked, note) {
+        var service = sidebarRightService();
+        if (!service || typeof service.openTab !== "function") {
+          console.error("[" + PACKAGE_ID + "] " + T.askFailed);
+          return;
+        }
+        try {
+          service.openTab(panel.KIND, {
+            params: {
+              text: picked.text,
+              truncated: picked.truncated === true,
+              // 就地输入栏里写的那句话，成为侧边对话的第一个问题
+              question: typeof note === "string" ? note : ""
+            }
+          });
+        } catch (error) {
+          console.error("[" + PACKAGE_ID + "] 打开侧边对话失败：", error);
+        }
+      }
+
+      ctx.effect(function () {
+        if (!ctx.sidebarRightTabs || typeof ctx.sidebarRightTabs.register !== "function") {
+          // 侧边栏插件不在这个组合里：划词引用照常工作，只是没有第二个按钮。
+          console.warn("[" + PACKAGE_ID + "] sidebarRightTabs 不可用，侧边提问这一项不会出现。");
+          return function () {};
+        }
+        return ctx.sidebarRightTabs.register({
+          id: PACKAGE_ID,
+          kind: panel.KIND,
+          // 页面型标签页（没有 patterns）：由 kind 点名打开，不认领任何资源地址。
+          title: function () { return T.sideTitle; }
+        });
+      }, PACKAGE_ID + ": sidebar tab type");
+
+      ctx.effect(function () {
+        if (!ctx.slots || typeof ctx.slots.inject !== "function") return function () {};
+        return ctx.slots.inject("sidebar.right.pane.tab", function () {
+          return ctx.slots.register({
+            name: "sidebar.right.pane.tab",
+            key: PACKAGE_ID
+          }, panel.Panel);
+        });
+      }, PACKAGE_ID + ": sidebar tab body");
 
       /* ---------- 注册 ---------- */
       ctx.effect(function () {
@@ -554,8 +1039,15 @@
     };
   }
 
-  /** 需要宿主保证的服务：插槽注册表。少了它注册不了 component。 */
-  var inject = ["slots"];
+  /**
+   * 需要宿主保证的服务。
+   *
+   * 只声明**确定存在**的两个：插槽注册表（画那个隐形锚点）与右侧栏标签注册表
+   * （挂侧边对话）。`sidebarRight` 控制器故意**不**写进 inject —— 它只在点击那一刻
+   * 用一次，用 `ctx.get()` 惰性取；少声明一个服务，就少一条"服务没起来导致整棵
+   * 插件树被丢掉"的路。
+   */
+  var inject = ["slots", "sidebarRightTabs"];
 
   /**
    * 模块导出 —— 官方形状是「factory 的返回值 = 模块 exports」。
@@ -578,4 +1070,10 @@
     }
   };
 })();
+
+
+
+
+
+
 

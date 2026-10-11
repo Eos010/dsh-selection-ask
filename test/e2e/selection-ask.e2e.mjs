@@ -295,6 +295,108 @@ if (toolbar) {
   }
 }
 
+/* 7. 侧边提问：选中 → 点「侧边提问」→ 右侧栏开出面板 → 面板里带着刚才那段引用 */
+await clearComposer();
+await cdp.dragSelect(target.from, target.to);
+await sleep(400);
+
+const askButton = await cdp.evaluate(`
+  const el = document.querySelector('[data-dsa="ask"]');
+  if (!el) return null;
+  const rect = el.getBoundingClientRect();
+  return { label: el.innerText.trim(), x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+`);
+check("浮层上有「侧边提问」按钮", askButton !== null, askButton ? askButton.label : "没有");
+
+let panel = null;
+if (askButton) {
+  await cdp.clickAt(askButton.x, askButton.y);
+  await sleep(1200);
+  panel = await cdp.evaluate(`
+    const root = document.querySelector('[data-dsa="panel"]');
+    if (!root) return null;
+    const quote = root.querySelector('.dsa-panel__quoteBody');
+    const input = root.querySelector('.dsa-panel__input');
+    const rect = root.getBoundingClientRect();
+    return {
+      quoteText: quote ? quote.innerText : null,
+      hasInput: !!input,
+      inputRect: input ? (() => { const r = input.getBoundingClientRect(); return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })() : null,
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+      onScreen: rect.width > 120 && rect.height > 120
+    };
+  `);
+  check("点了「侧边提问」后右侧栏开出面板", panel !== null);
+  if (panel) {
+    check(
+      "面板里带着刚选中的那段引用",
+      typeof panel.quoteText === "string" && panel.quoteText.includes(selected.text.slice(0, 12)),
+      JSON.stringify(panel.quoteText ?? "").slice(0, 80)
+    );
+    check("面板有自己的输入框", panel.hasInput && panel.inputRect !== null);
+    check("面板真的占到了右侧栏的位置（不是 0 尺寸）", panel.onScreen, `${panel.width}×${panel.height}`);
+  }
+}
+
+/* 8. 在面板里问一句：回答必须真的长出来，而且**不能进主对话** */
+if (panel && panel.inputRect) {
+  const draftBefore = await cdp.evaluate(READ_DRAFT);
+  await cdp.clickAt(panel.inputRect.x, panel.inputRect.y);
+  await sleep(200);
+  await cdp.send("Input.insertText", { text: "用一句话回答。" });
+  await sleep(250);
+
+  const sendButton = await cdp.evaluate(`
+    const root = document.querySelector('[data-dsa="panel"]');
+    const button = root && root.querySelector('.dsa-panel__actions .dsa-btn--primary');
+    if (!button || button.disabled) return null;
+    const rect = button.getBoundingClientRect();
+    return { label: button.innerText.trim(), x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+  `);
+  check("面板有可用的发送按钮", sendButton !== null, sendButton ? sendButton.label : "禁用/不存在");
+
+  if (sendButton) {
+    await cdp.clickAt(sendButton.x, sendButton.y);
+
+    // 轮询等答案长出来；模型是流式的，这里等的是"面板里出现了非空回答且不再忙"
+    let answer = "";
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      await sleep(1500);
+      const snapshot = await cdp.evaluate(`
+        const root = document.querySelector('[data-dsa="panel"]');
+        if (!root) return { answer: "", busy: false, error: null };
+        const assistants = [...root.querySelectorAll('.dsa-panel__turn[data-role="assistant"] .dsa-panel__text')];
+        const error = root.querySelector('.dsa-panel__error');
+        return {
+          answer: assistants.length ? assistants[assistants.length - 1].innerText : "",
+          busy: root.getAttribute('data-busy') === '1',
+          error: error ? error.innerText : null
+        };
+      `);
+      if (snapshot.error) {
+        check("面板提问没有报错", false, snapshot.error);
+        break;
+      }
+      // 占位文案不算答案
+      if (snapshot.answer && snapshot.answer !== "思考中…") {
+        answer = snapshot.answer;
+        if (!snapshot.busy) break;
+      }
+    }
+    check("面板里长出了回答", answer.length > 0, JSON.stringify(answer).slice(0, 90));
+
+    const afterAsk = await cdp.evaluate(READ_DRAFT);
+    check(
+      "侧边提问没有污染主对话的输入框",
+      afterAsk === draftBefore,
+      `之前 ${JSON.stringify((draftBefore ?? "").slice(0, 24))} → 之后 ${JSON.stringify((afterAsk ?? "").slice(0, 24))}`
+    );
+
+    await shot("side-panel");
+  }
+}
+
 /* ───────────────────────────── 汇总 ───────────────────────────── */
 
 const failed = results.filter((item) => !item.ok);

@@ -119,6 +119,40 @@
   opacity: 1;
 }
 
+/* ── 就地输入栏（参考图4：选中后直接在原文旁边写批注） ── */
+
+.dsa-note {
+  width: 190px;
+  height: 26px;
+  box-sizing: border-box;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--dsw-alias-label-primary, #0f1115);
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1;
+  outline: none;
+  /* 选区还在的时候输入框自己得能选中文字，别继承浮层的"不许选中" */
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.dsa-note::placeholder {
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.dsa-note:focus {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(15, 17, 21, 0.06));
+}
+
+/* 图标+文字的小按钮：输入框在场时它们要更紧凑 */
+.dsa-btn--icon {
+  padding: 0 8px;
+  gap: 5px;
+}
+
 /* ───────────────────────── 「已引用」提示 ───────────────────────── */
 
 /*
@@ -166,6 +200,204 @@
   .dsa-toast {
     animation: none;
   }
+}
+
+/* ───────────────────────── 侧边提问面板 ───────────────────────── */
+
+/*
+ * 面板长在右侧栏的一个标签页里，所以它必须**填满**容器并自己滚动，
+ * 不能有自己的固定尺寸 —— 右侧栏可以被拖宽、可以全屏、可以被拆成两个 pane。
+ */
+.dsa-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  box-sizing: border-box;
+  color: var(--dsw-alias-label-primary, #0f1115);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+/* ── 引用区 ── */
+
+.dsa-panel__quote {
+  flex: none;
+  margin: 8px 10px 0;
+  border: 1px solid var(--dsw-alias-border-l1, rgba(15, 17, 21, 0.06));
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-2, rgba(15, 17, 21, 0.03));
+  overflow: hidden;
+}
+
+.dsa-panel__quoteHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 9px;
+  font-size: 11.5px;
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.dsa-panel__quoteBody {
+  padding: 0 9px 8px;
+  max-height: 30vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--dsw-alias-label-secondary, #61666b);
+  font-size: 12px;
+  /* 引用是"背景材料"，不是主体 —— 左侧一道竖线把它和正文分开 */
+  border-left: 2px solid var(--dsw-alias-border-l3, rgba(15, 17, 21, 0.16));
+  margin-left: 9px;
+  padding-left: 8px;
+}
+
+.dsa-link {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--dsw-alias-brand-primary, #4a6cf7);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.dsa-link:hover {
+  text-decoration: underline;
+}
+
+/* ── 消息区 ── */
+
+.dsa-panel__scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dsa-panel__empty {
+  margin: auto 4px;
+  text-align: center;
+  color: var(--dsw-alias-label-secondary, #61666b);
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.dsa-panel__turn {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.dsa-panel__turn[data-role="user"] {
+  align-items: flex-end;
+}
+
+.dsa-panel__who {
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.dsa-panel__text {
+  max-width: 100%;
+  padding: 7px 10px;
+  border-radius: 9px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--dsw-alias-bg-layer-2, rgba(15, 17, 21, 0.04));
+}
+
+.dsa-panel__turn[data-role="user"] .dsa-panel__text {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(15, 17, 21, 0.07));
+}
+
+.dsa-panel__error {
+  flex: none;
+  margin: 0 10px 6px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--dsw-alias-state-error-primary, #e43c3c);
+  border: 1px solid var(--dsw-alias-state-error-primary, #e43c3c);
+  background: transparent;
+  word-break: break-word;
+}
+
+/* ── 输入区 ── */
+
+.dsa-panel__composer {
+  flex: none;
+  border-top: 1px solid var(--dsw-alias-border-l1, rgba(15, 17, 21, 0.06));
+  padding: 8px 10px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dsa-panel__input {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 56px;
+  max-height: 30vh;
+  padding: 7px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(15, 17, 21, 0.12));
+  background: var(--dsw-alias-bg-base, transparent);
+  color: var(--dsw-alias-label-primary, #0f1115);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.dsa-panel__input:focus {
+  outline: none;
+  border-color: var(--dsw-alias-brand-primary, #4a6cf7);
+}
+
+.dsa-panel__input:disabled {
+  opacity: 0.6;
+}
+
+.dsa-panel__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+/* 面板里的按钮比浮层里的大一号 —— 它是主要操作，不是快捷动作 */
+.dsa-btn--ghost,
+.dsa-btn--primary {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  font-size: 12.5px;
+}
+
+.dsa-btn--ghost {
+  border-color: var(--dsw-alias-border-l2, rgba(15, 17, 21, 0.12));
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.dsa-btn--primary {
+  background: var(--dsw-alias-button-primary-fill, #4a6cf7);
+  color: var(--dsw-alias-label-primary-foreground, #ffffff);
+}
+
+.dsa-btn--primary:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.dsa-btn--primary:not(:disabled):hover {
+  filter: brightness(1.06);
 }
 
 /* ─────────── 兜底配色：宿主 token 全缺时的深色底 ─────────── */

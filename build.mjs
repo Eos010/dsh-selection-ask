@@ -25,7 +25,14 @@ import { fileURLToPath } from "node:url";
 const here = (name) => join(dirname(fileURLToPath(import.meta.url)), name);
 
 const PLACEHOLDER = "__SELECTION_ASK_CSS__";
-const SOURCE_FILE = "client.js";
+/**
+ * 源码文件，**按顺序**拼进同一个 loader 工厂函数体。
+ *
+ * 顺序即依赖：`ask-panel.js` 只声明 `createAskPanel`（不导出、不自执行），
+ * `client.js` 在自己的 IIFE 里调用它。两者共享同一个函数作用域，
+ * 所以不需要模块系统、也不需要打包器。
+ */
+const SOURCE_FILES = ["ask-panel.js", "client.js"];
 const CSS_FILE = "selection-ask.css";
 const OUT_FILE = "lib/client.js";
 
@@ -47,31 +54,45 @@ process.stdout.write("\ndsh-selection-ask · build\n");
 /* ── 1. 读入 ───────────────────────────────────────────────────── */
 
 const pkg = JSON.parse(readFileSync(here("package.json"), "utf8"));
-const source = toLf(readFileSync(here(SOURCE_FILE), "utf8"));
+const sources = SOURCE_FILES.map((name) => ({ name, text: toLf(readFileSync(here(name), "utf8")) }));
+const source = sources.map((item) => item.text).join("\n");
 const css = toLf(readFileSync(here(CSS_FILE), "utf8"));
-const before = { source: sha(source), css: sha(css) };
+const before = {
+  sources: Object.fromEntries(sources.map((item) => [item.name, sha(item.text)])),
+  css: sha(css)
+};
 
-step(`读入 ${SOURCE_FILE} ${source.length}B · ${CSS_FILE} ${css.length}B`);
+step(
+  `读入 ${sources.map((item) => `${item.name} ${item.text.length}B`).join(" + ")} · ${CSS_FILE} ${css.length}B`
+);
 
 /* ── 2. 闸门：占位符 ───────────────────────────────────────────── */
 
 const placeholderCount = source.split(PLACEHOLDER).length - 1;
 assert(
   placeholderCount === 1,
-  `${SOURCE_FILE} 里 ${PLACEHOLDER} 出现了 ${placeholderCount} 次（必须恰好 1 次）—— ` +
+  `${SOURCE_FILES.join(" + ")} 里 ${PLACEHOLDER} 共出现 ${placeholderCount} 次（必须恰好 1 次）—— ` +
     "0 次说明占位符被删了，多次会让替换静默生效在错误的位置。"
 );
 assert(
   !css.includes(PLACEHOLDER),
-  `${CSS_FILE} 里含占位符本身；占位符只应出现在 ${SOURCE_FILE} 的 var CSS = … 注入点。`
+  `${CSS_FILE} 里含占位符本身；占位符只应出现在 client.js 的 var CSS = … 注入点。`
 );
 
 /* ── 3. 组装产物 ───────────────────────────────────────────────── */
 
-const body = source.split(PLACEHOLDER).join(JSON.stringify(css));
+// 逐文件注入：占位符只在 client.js 里，但断言按"整份源码恰好一次"做，所以这里
+// 只在含占位符的那一份上替换，并对每一份都做一次"没有残留占位符"的复核。
+const body = sources
+  .map((item) => {
+    const text = item.text.split(PLACEHOLDER).join(JSON.stringify(css));
+    assert(!text.includes(PLACEHOLDER), `${item.name} 替换后仍残留占位符`);
+    return `/* ── ${item.name} ── */\n${text}`;
+  })
+  .join("\n");
 
 const banner = [
-  "/* 由 build.mjs 生成，请勿直接编辑；改 client.js 或 selection-ask.css 后重新构建。 */",
+  "/* 由 build.mjs 生成，请勿直接编辑；改 ask-panel.js / client.js / selection-ask.css 后重新构建。 */",
   "window.__ModuleLoader__.load({",
   `  id: ${JSON.stringify(pkg.name)},`,
   "  factory: function (require) {",
@@ -133,11 +154,13 @@ writeFileSync(here(OUT_FILE), output, "utf8");
 
 /* ── 6. 漂移防线：构建期间源码不得变动 ─────────────────────────── */
 
-const afterSource = sha(toLf(readFileSync(here(SOURCE_FILE), "utf8")));
+const afterSources = Object.fromEntries(
+  SOURCE_FILES.map((name) => [name, sha(toLf(readFileSync(here(name), "utf8")))])
+);
 const afterCss = sha(toLf(readFileSync(here(CSS_FILE), "utf8")));
 assert(
-  afterSource === before.source && afterCss === before.css,
-  "构建期间源码发生了变化（有别的进程在写这两个文件）—— 产物可能是混合体，请重新构建。"
+  SOURCE_FILES.every((name) => afterSources[name] === before.sources[name]) && afterCss === before.css,
+  "构建期间源码发生了变化（有别的进程在写这些文件）—— 产物可能是混合体，请重新构建。"
 );
 
 /* ── 7. 报告 ───────────────────────────────────────────────────── */

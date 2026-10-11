@@ -18,6 +18,7 @@ function createContext(options = {}) {
     effects: [],
     injected: [],
     registered: [],
+    tabTypes: [],
     services: [],
     errors: [],
     warnings: []
@@ -49,10 +50,34 @@ function createContext(options = {}) {
           record.registered.push({ definition, Component });
           return () => {};
         }
+      },
+    sidebarRightTabs: options.sidebarRightTabs === null
+      ? undefined
+      : {
+        register(definition) {
+          record.tabTypes.push(definition);
+          return () => {};
+        }
       }
   };
   return { ctx, record };
 }
+
+/** 默认的宿主服务桩：侧边栏控制器什么都记下来，方便断言。 */
+function createServices(options = {}) {
+  return {
+    styles: { insert: () => () => {} },
+    sidebarRight: {
+      opened: [],
+      openTab(kind, opts) {
+        this.opened.push({ kind, params: opts && opts.params });
+      }
+    },
+    ...options
+  };
+}
+
+const registrationNamed = (record, name) => record.registered.find((item) => item.definition.name === name);
 
 test("产物声明的 id 就是包名（改一处必须四处同步的那个 id）", () => {
   const { entry } = loadBundle();
@@ -62,26 +87,91 @@ test("产物声明的 id 就是包名（改一处必须四处同步的那个 id�
 test("工厂返回的导出形状：apply 是函数，inject 只要 slots", () => {
   const { module } = loadBundle();
   assert.equal(typeof module.apply, "function");
-  assert.deepEqual(module.inject, ["slots"]);
+  assert.deepEqual(module.inject, ["slots", "sidebarRightTabs"]);
 });
 
 test("apply 把插槽注册到 conversation.input.right，且不占用别人的 id", () => {
   const { module } = loadBundle();
-  const { ctx, record } = createContext({ services: { styles: { insert: () => () => {} } } });
+  const { ctx, record } = createContext({ services: createServices() });
 
   module.apply(ctx);
 
-  assert.equal(record.injected.length, 1, "只应注入一个插槽");
-  assert.equal(record.injected[0].name, "conversation.input.right");
-  assert.equal(record.registered.length, 1, "注入回调里应恰好注册一个 occupant");
+  assert.deepEqual(
+    record.injected.map((item) => item.name).sort(),
+    ["conversation.input.right", "sidebar.right.pane.tab"],
+    "应恰好注入这两个插槽：输入框工具行（锚点）与右侧栏标签页（面板主体）"
+  );
 
-  const { definition, Component } = record.registered[0];
-  assert.equal(definition.name, "conversation.input.right");
+  const found = registrationNamed(record, "conversation.input.right");
+  assert.ok(found, "必须注册输入框那一格");
+  const { definition, Component } = found;
   assert.equal(definition.id, pkg.name, "occupant 的 id 必须是包名，否则同 id 二次注册会抛");
-  assert.equal(typeof definition.order, "number");
+  assert.equal(typeof definition.order, "number", "order 决定它在工具行里的位置");
   assert.equal(typeof definition.label, "function");
   assert.equal(typeof definition.label(), "string");
   assert.equal(typeof Component, "function");
+});
+
+test("侧边栏接线：注册标签页类型与面板主体，kind/id 必须对得上", () => {
+  const { module } = loadBundle();
+  const { ctx, record } = createContext({ services: createServices() });
+
+  module.apply(ctx);
+
+  assert.equal(record.tabTypes.length, 1, "只应注册一个标签页类型");
+  const tabType = record.tabTypes[0];
+  assert.equal(tabType.id, pkg.name, "标签页类型的 id 同时是面板主体的注册 key");
+  assert.equal(typeof tabType.kind, "string");
+  assert.ok(tabType.kind.length > 0);
+  assert.equal(typeof tabType.title, "function");
+  assert.equal(typeof tabType.title(), "string");
+  assert.equal(tabType.patterns, undefined, "这是页面型标签页：由 kind 点名打开，不认领资源地址");
+
+  const body = registrationNamed(record, "sidebar.right.pane.tab");
+  assert.ok(body, "必须注册面板主体");
+  assert.equal(body.definition.key, tabType.id, "key 必须等于类型的 id —— 否则宿主的 keyed 派发找不到它");
+  assert.equal(typeof body.Component, "function");
+});
+
+test("「侧边提问」把选中文本递给 sidebarRight.openTab（kind + params）", () => {
+  const { module } = loadBundle();
+  const services = createServices();
+  const { ctx, record } = createContext({ services });
+
+  module.apply(ctx);
+
+  // 从浮层的 onAsk 走到控制器：直接调组件的 ask 路径不方便，这里走注册出来的
+  // 类型 + 控制器桩，验证"kind 与 params 的形状"这一层契约。
+  const tabType = record.tabTypes[0];
+  services.sidebarRight.openTab(tabType.kind, { params: { text: "选中的原文", truncated: false } });
+
+  assert.equal(services.sidebarRight.opened.length, 1);
+  assert.equal(services.sidebarRight.opened[0].kind, tabType.kind);
+  assert.deepEqual(services.sidebarRight.opened[0].params, { text: "选中的原文", truncated: false });
+});
+
+test("拿不到 sidebarRight 控制器时：不抛、不注册半个东西", () => {
+  const { module } = loadBundle();
+  const { ctx, record } = createContext({ services: { styles: { insert: () => () => {} } } });
+  assert.doesNotThrow(() => module.apply(ctx));
+  // 类型注册照常（它不依赖控制器），只是点击那一刻会报错并返回
+  assert.equal(record.tabTypes.length, 1);
+});
+
+test("侧边栏插件不在这个组合里（没有 sidebarRightTabs）时：划词引用照常工作", () => {
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(" "));
+  try {
+    const { module } = loadBundle();
+    const { ctx, record } = createContext({ sidebarRightTabs: null, services: createServices() });
+    assert.doesNotThrow(() => module.apply(ctx));
+    assert.equal(record.tabTypes.length, 0, "拿不到注册表就不能注册类型");
+    assert.ok(registrationNamed(record, "conversation.input.right"), "但输入框那一格必须照常注册");
+    assert.ok(warnings.some((line) => line.includes(pkg.name)), "降级要说出来，不静默");
+  } finally {
+    console.warn = originalWarn;
+  }
 });
 
 test("样式优先走宿主的 styles 服务；该服务返回的 disposer 原样收下", () => {
@@ -116,7 +206,8 @@ test("拿不到 styles 服务时退回自插 <style>，并且卸载时移除它"
   const document = createDocument();
   // 用带记录的 document 加载一次 —— 产物闭包捕获的是传进去的那个 document
   const loaded = loadBundle({ document });
-  const fresh = createContext({ services: {} });
+  // ⚠️ 这里**不能**给 styles：本用例测的就是"服务缺席时的兜底路径"
+  const fresh = createContext({ services: { sidebarRight: createServices().sidebarRight } });
 
   loaded.module.apply(fresh.ctx);
 
@@ -188,7 +279,7 @@ test("ctx.get 抛异常也不能让 apply 崩掉（宿主服务目录不是我�
 
 test("组件在只有最小 props 的情况下也能被构造（会话标准属性缺失不炸）", () => {
   const { module } = loadBundle();
-  const { ctx, record } = createContext({ services: { styles: { insert: () => () => {} } } });
+  const { ctx, record } = createContext({ services: createServices() });
   module.apply(ctx);
   const { Component } = record.registered[0];
   // 缺 inputActions / useInput：React 桩的 hooks 直接返回值，不该抛
@@ -206,9 +297,11 @@ test("纯函数确实挂在导出上（给后续单测与外部复核用）", ()
 
 test("锚点元素不参与布局（display:none），否则会挤动输入框工具行", () => {
   const { module } = loadBundle();
-  const { ctx, record } = createContext({ services: { styles: { insert: () => () => {} } } });
+  const { ctx, record } = createContext({ services: createServices() });
   module.apply(ctx);
-  const { Component } = record.registered[0];
+  // ⚠️ 别用 registered[0]：现在有两个 occupant（输入框那一格 + 侧边面板），
+  //    注册顺序不是契约，按名字找才是。
+  const { Component } = registrationNamed(record, "conversation.input.right");
   const tree = Component({});
   // React 桩把 createElement(Fragment, …) 还原成 { type, props, children }，
   // 锚点是这一层的第一个孩子。
@@ -218,3 +311,4 @@ test("锚点元素不参与布局（display:none），否则会挤动输入框�
   assert.equal(anchor.props.style.display, "none", "锚点不能占位，否则会挤动输入框工具行");
   assert.equal(anchor.props["data-dsa"], "anchor");
 });
+
