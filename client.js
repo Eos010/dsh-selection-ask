@@ -415,6 +415,13 @@
       var quoteByText = new Map();
       /** 胶囊在 DOM 上只有 label（title="选中文本 1"），没有 ref —— 靠它反查。 */
       var quoteByLabel = new Map();
+      /**
+       * 已经插进输入框的胶囊，在**剪贴板投影**里一共占了多少字符。
+       *
+       * 用来算下一个胶囊的插入点：`draft` 是剪贴板投影（胶囊在里面占位），
+       * 而编辑坐标里它几乎不占位 —— 两者差的就是这个数（2026-10-11 实测）。
+       */
+      var chipClipTotal = 0;
 
       /** 给一段原文分配（或取回）它的编号记录。 */
       function registerQuote(text) {
@@ -425,6 +432,8 @@
         quoteByRef.set(record.ref, record);
         quoteByText.set(text, record);
         quoteByLabel.set(chipLabel(record), record);
+        // 新引用一进来就重算标注（节流到每帧一次）
+        scheduleHighlightSync();
         return record;
       }
 
@@ -523,7 +532,19 @@
         if (!ensureReferenceSource()) return "no-reference-source";
         var candidates = sessionScopes(sessionId);
         if (candidates.length === 0) return "no-session-scope";
-        var start = typeof at === "number" ? at : draft.length;
+        // ⚠️ 插入点不止一个候选，**逐个试**（2026-10-11 实测）。
+        //
+        // 原因：`draft` 是**剪贴板投影**，里面已有的胶囊各占了它 `clipboardText`
+        // 那么多字符；而 `insertText` / `insertReference` 的 span 要的是**编辑坐标**，
+        // 胶囊在那里几乎不占位。所以草稿里一旦有胶囊，`draft.length` 就落到坐标
+        // 空间之外 —— 表现是"第一次引用能出胶囊，第二次插不进去"。
+        //
+        // 与其猜哪套坐标，不如把候选都发一遍，**让 `bail` 的返回值挑出对的那个**。
+        var base = typeof at === "number" ? at : draft.length;
+        var spots = [];
+        var trimmed = base - chipClipTotal;
+        if (chipClipTotal > 0 && trimmed >= 0 && trimmed !== base) spots.push(trimmed);
+        spots.push(base);
         var tried = [];
         for (var index = 0; index < candidates.length; index += 1) {
           var candidate = candidates[index];
@@ -537,24 +558,30 @@
             tried.push(candidate.via + "=no-bail");
             continue;
           }
-          try {
-            var accepted = candidate.actx.bail("slash/input-insert-reference", {
-              reference: {
-                source: REF_SOURCE,
-                ref: record.ref,
-                label: chipLabel(record),
-                // ⚠️ DSH 只给三种 glyph（session / file / folder），没有"引用号"图标。
-                //    `session` 是那个对话气泡，是三种里最接近参考图的。
-                appearance: "session",
-                clipboardText: quoteMarkdown(record.text)
-              },
-              // 折叠 span：默认插在草稿末尾，也允许点名位置（见 commit 里的顺序说明）
-              span: { start: start, end: start, draftRev: draftRev }
-            });
-            if (accepted === true) return null;
-            tried.push(candidate.via + "=" + String(accepted));
-          } catch (error) {
-            tried.push(candidate.via + " threw " + String(error && error.message ? error.message : error));
+          for (var spot = 0; spot < spots.length; spot += 1) {
+            try {
+              var accepted = candidate.actx.bail("slash/input-insert-reference", {
+                reference: {
+                  source: REF_SOURCE,
+                  ref: record.ref,
+                  label: chipLabel(record),
+                  // ⚠️ DSH 只给三种 glyph（session / file / folder），没有"引用号"图标。
+                  //    `session` 是那个对话气泡，是三种里最接近参考图的。
+                  appearance: "session",
+                  clipboardText: quoteMarkdown(record.text)
+                },
+                // 折叠 span：插在候选位置
+                span: { start: spots[spot], end: spots[spot], draftRev: draftRev }
+              });
+              if (accepted === true) {
+                // 记下这个胶囊在剪贴板投影里占的长度，给下一个胶囊算插入点用
+                chipClipTotal += quoteMarkdown(record.text).length;
+                return null;
+              }
+              tried.push(candidate.via + "@" + spots[spot] + "=" + String(accepted));
+            } catch (error) {
+              tried.push(candidate.via + "@" + spots[spot] + " threw " + String(error && error.message ? error.message : error));
+            }
           }
         }
         return "not-accepted(" + tried.join(", ") + ")";
@@ -582,6 +609,131 @@
         }
         return false;
       }
+      /* ---------- 原文标注：高亮 + 编号（参考图1） ---------- */
+      /**
+       * 设计取向＝**稳定能用**，不是效果拉满。三条决定都是为这个：
+       *
+       *  1. **高亮用浏览器原生的 CSS Custom Highlight API**（`CSS.highlights`），
+       *     **完全不碰 DOM** —— 不给 React 添任何麻烦，也就不会被下一次渲染冲掉。
+       *     （插 `<mark>` 再靠 MutationObserver 重挂的做法，在流式输出的转录里
+       *     会一直和 React 打架，那是"效果到位但不可靠"的典型。）
+       *
+       *  2. **锚点按"原文文字"找回来，不存字符偏移。** 转录是 React 按会话日志
+       *     重渲染的，偏移一定会漂；存文字则每次都能重新锚定。
+       *
+       *  3. **找不到就什么都不做。** 转录做了虚拟化时滚出屏幕的消息不在 DOM 里，
+       *     这时高亮与编号**暂时不出现**（滚回来就恢复）—— 这是设计边界，不是 bug；
+       *     而且绝不允许因此抛错。
+       *
+       * 已知边界（不藏）：① 同一段文字在转录里出现多次时，取**第一处**；
+       * ② 引用的原文必须落在**单个文本节点**内（跨元素的选区锚不到）。
+       */
+      var HIGHLIGHT_KEY = "dsh-selection-ask";
+      // ⚠️ 必须显式写 `window.CSS`：本文件顶部有一个同名变量存着样式表文本，
+      //    裸写 CSS 会命中那个字符串（作用域遮蔽），于是永远判定"不支持"。
+      var highlightSupported = typeof window !== "undefined" && !!window.CSS
+        && !!window.CSS.highlights && typeof window.Highlight === "function";
+      var badgeLayer = null;
+      var badgeEntries = [];
+      var syncScheduled = 0;
+
+      /** 编号牌那一层：挂在已有的 portal 宿主里，跟浮层共用同一个层级。 */
+      function ensureBadgeLayer() {
+        if (badgeLayer && badgeLayer.isConnected) return badgeLayer;
+        badgeLayer = document.createElement("div");
+        badgeLayer.setAttribute(OWN_ATTR, "");
+        badgeLayer.setAttribute("data-dsa", "badges");
+        badgeLayer.style.cssText = "position:fixed;left:0;top:0;width:0;height:0;pointer-events:none;";
+        ensureHost().appendChild(badgeLayer);
+        return badgeLayer;
+      }
+
+      /**
+       * 在页面里按**文字**找回一段原文的 Range。
+       *
+       * 排除两类地方：我们自己画的浮层（不然会锚到编号牌自己），
+       * 以及输入框（那里的是胶囊的 label，不是原文）。
+       *
+       * @returns {Range|null}
+       */
+      function findQuoteRange(needle) {
+        if (!needle) return null;
+        var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+          acceptNode: function (node) {
+            var value = node.nodeValue;
+            if (!value || value.indexOf(needle) < 0) return NodeFilter.FILTER_REJECT;
+            var parent = node.parentElement;
+            if (!parent) return NodeFilter.FILTER_REJECT;
+            if (parent.closest("[" + OWN_ATTR + "]")) return NodeFilter.FILTER_REJECT;
+            if (parent.closest('[contenteditable="true"],[contenteditable=""]')) return NodeFilter.FILTER_REJECT;
+            return NodeFilter.FILTER_ACCEPT;
+          }
+        });
+        var node = walker.nextNode();
+        if (!node) return null;
+        var at = node.nodeValue.indexOf(needle);
+        if (at < 0) return null;
+        try {
+          var range = document.createRange();
+          range.setStart(node, at);
+          range.setEnd(node, at + needle.length);
+          return range;
+        } catch (error) {
+          return null;
+        }
+      }
+
+      /** 把编号牌摆到各自 Range 的右上角。 */
+      function placeBadges() {
+        var layer = ensureBadgeLayer();
+        while (layer.firstChild) layer.removeChild(layer.firstChild);
+        for (var index = 0; index < badgeEntries.length; index += 1) {
+          var entry = badgeEntries[index];
+          var rect = null;
+          try {
+            rect = entry.range.getBoundingClientRect();
+          } catch (error) {
+            continue;
+          }
+          if (!rect || (rect.width === 0 && rect.height === 0)) continue;   // 不在视口里／已分离
+          var badge = document.createElement("span");
+          badge.className = "dsa-badge";
+          badge.setAttribute("data-dsa", "badge");
+          badge.textContent = String(entry.n);
+          badge.style.left = Math.round(rect.right - 5) + "px";
+          badge.style.top = Math.round(rect.top - 7) + "px";
+          layer.appendChild(badge);
+        }
+      }
+
+      /** 重算高亮与编号牌。任何异常都吞掉 —— 标注失败绝不允许影响插件本体。 */
+      function syncHighlights() {
+        if (!highlightSupported) return;
+        try {
+          var highlight = new Highlight();
+          badgeEntries = [];
+          quoteByRef.forEach(function (record) {
+            var range = findQuoteRange(record.text);
+            if (!range) return;
+            highlight.add(range);
+            badgeEntries.push({ n: record.n, range: range });
+          });
+          window.CSS.highlights.set(HIGHLIGHT_KEY, highlight);
+          placeBadges();
+        } catch (error) {
+          /* 标注是锦上添花，坏了不能连累引用本身 */
+        }
+      }
+
+      /** 节流到每帧一次：流式输出时转录一直在变，不节流会每帧跑好几遍。 */
+      function scheduleHighlightSync() {
+        if (!highlightSupported || syncScheduled) return;
+        syncScheduled = window.requestAnimationFrame(function () {
+          syncScheduled = 0;
+          syncHighlights();
+        });
+      }
+
       /* ---------- portal 宿主：一个挂在 body 上的固定层 ---------- */
       var hostEl = null;
       function ensureHost() {
@@ -724,15 +876,15 @@
 
         if (!selection) return null;
 
-        var commit = function (event) {
-          if (event) event.preventDefault();
-          onCommit(selection, note.trim());
+        var commit = function (sendNow) {
+          onCommit(selection, note.trim(), sendNow === true);
         };
         var onKeyDown = function (event) {
           if (event.key === "Escape") return;                       // 交给全局 Esc 收起
           if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
           event.preventDefault();
-          commit();
+          // Ctrl / Cmd + Enter = 写进输入框并**立刻发出去**（普通 Enter 只写不发）
+          commit(event.ctrlKey || event.metaKey);
         };
 
         return h("div", {
@@ -919,6 +1071,19 @@
               anchor: picked.anchor
             });
             window.setTimeout(function () { setFlash(null); }, FLASH_MS);
+            // 「直接发送」：Ctrl/Cmd+Enter 提交后立刻把这条发出去。
+            // 放在 flash 的收尾里，是因为它**只在真的写进去了**的路径上被调用 ——
+            // 兜底拒绝写入（草稿里已有胶囊）时不会误发一条空消息。
+            if (sendNow === true) {
+              window.requestAnimationFrame(function () {
+                try {
+                  if (inputActions && typeof inputActions.submit === "function") inputActions.submit();
+                  else console.warn("[" + PACKAGE_ID + "] 拿不到 inputActions.submit，没能直接发送。");
+                } catch (error) {
+                  console.error("[" + PACKAGE_ID + "] 直接发送失败：", error);
+                }
+              });
+            }
           };
 
           /** 降级必须**出声**：这是一次看得见的行为变化，不是内部细节。 */
@@ -1129,6 +1294,30 @@
           hostEl = null;
         };
       }, PACKAGE_ID + ": portal host");
+
+      /* ---------- 标注的驱动：转录一变就重算（节流到每帧一次） ---------- */
+      ctx.effect(function () {
+        if (!highlightSupported) {
+          // 不支持就明说一次，然后整个功能静默缺席 —— 引用本身照常工作。
+          console.warn("[" + PACKAGE_ID + "] 这个浏览器没有 CSS Custom Highlight API，原文高亮与编号不会出现。");
+          return function () {};
+        }
+        var observer = new MutationObserver(scheduleHighlightSync);
+        observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+        window.addEventListener("scroll", scheduleHighlightSync, true);
+        window.addEventListener("resize", scheduleHighlightSync);
+        scheduleHighlightSync();
+        return function () {
+          observer.disconnect();
+          window.removeEventListener("scroll", scheduleHighlightSync, true);
+          window.removeEventListener("resize", scheduleHighlightSync);
+          if (syncScheduled) { window.cancelAnimationFrame(syncScheduled); syncScheduled = 0; }
+          try { window.CSS.highlights.delete(HIGHLIGHT_KEY); } catch (error) { /* 已经没了 */ }
+          badgeEntries = [];
+          if (badgeLayer && badgeLayer.parentElement) badgeLayer.parentElement.removeChild(badgeLayer);
+          badgeLayer = null;
+        };
+      }, PACKAGE_ID + ": transcript highlights");
     };
   }
 
@@ -1163,6 +1352,10 @@
     }
   };
 })();
+
+
+
+
 
 
 

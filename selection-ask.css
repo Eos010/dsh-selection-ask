@@ -441,6 +441,40 @@
   overflow: hidden;
 }
 
+/* ── 原文标注：高亮 + 编号（参考图1） ── */
+
+/*
+ * 高亮走 CSS Custom Highlight API —— **一个字节的 DOM 都不改**。
+ * 这是"稳定能用"的关键：插 <mark> 的做法会在流式输出的转录里
+ * 一直和 React 打架，而高亮 API 是浏览器自己画的，React 动不到它。
+ */
+::highlight(dsh-selection-ask) {
+  background-color: color-mix(in srgb, var(--dsw-alias-brand-primary, #4a6cf7) 26%, transparent);
+  color: inherit;
+}
+
+/* 编号牌：放在我们自己的浮层里，按 Range 的位置贴上去，不插进正文 */
+.dsa-badge {
+  position: fixed;
+  z-index: 2147483000;
+  pointer-events: none;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  box-sizing: border-box;
+  border-radius: 999px;
+  background: var(--dsw-alias-brand-primary, #4a6cf7);
+  color: var(--dsw-alias-label-primary-foreground, #ffffff);
+  font-family: inherit;
+  font-size: 10px;
+  line-height: 15px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  box-shadow: 0 1px 3px rgba(15, 17, 21, 0.18);
+  -webkit-user-select: none;
+  user-select: none;
+}
+
 /* ─────────── 兜底配色：宿主 token 全缺时的深色底 ─────────── */
 
 @media (prefers-color-scheme: dark) {
