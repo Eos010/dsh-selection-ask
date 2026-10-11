@@ -864,10 +864,12 @@
           }));
         }, [selection]);
 
-        // 出现即聚焦：选中 → 直接打字，不该还要再点一下
+        // 出现即聚焦：选中 → 直接打字，不该还要再点一下。
+        // ⚠️ 但**键盘选出来的选区不抢焦点** —— 否则按着 Shift+方向键选字时，
+        //    浮层一出现就把焦点抢走，选字当场中断（与拖拽被打断是同一类事故）。
         React.useEffect(function () {
           var node = inputRef.current;
-          if (!node || !selection) return;
+          if (!node || !selection || selection.autofocus === false) return undefined;
           var frame = window.requestAnimationFrame(function () {
             try { node.focus({ preventScroll: true }); } catch (error) { /* 聚焦失败不影响 */ }
           });
@@ -964,10 +966,30 @@
 
         React.useEffect(function () {
           var frame = 0;
+          /** 主键是否还按着 —— 按着就是"正在拖"，这时绝不能出浮层（见 flush）。 */
+          var pointerDown = false;
+          /** 这次选区是不是键盘选出来的（是的话浮层不抢焦点）。 */
+          var viaKeyboard = false;
           function flush() {
             frame = 0;
+            // ⚠️⚠️ **拖拽还没结束就绝不出浮层**（2026-10-11 他实测报的严重问题）。
+            //
+            // 症状：鼠标按住往下拖，**选不中字** —— 一拖就断。
+            //
+            // 根因：选区一变成非空就触发 selectionchange，浮层立刻弹出来并**自动聚焦**
+            // 输入栏；而"聚焦一个 input"会让浏览器当场结束这次拖拽、清掉选区。
+            // 真人拖拽要几百毫秒、会触发几十次 selectionchange，必然中招。
+            //
+            // 之前的端到端验收抓不到：CDP 的拖拽是一瞬间派发完的，浮层还来不及插进去。
+            // **真人手速比测试慢，慢就会被自己的浮层打断。**
+            //
+            // 判据：主键还按着 = 正在拖 = 什么都不做，等 mouseup 再算。
+            if (pointerDown) return;
             var next = readSelection();
             if (next) {
+              // 鼠标拖出来的选区才自动聚焦；键盘选出来的不抢焦点，
+              // 否则按着 Shift+方向键选字时也会被自己的浮层打断。
+              next.autofocus = !viaKeyboard;
               setSelection(next);
               return;
             }
@@ -987,13 +1009,21 @@
             frame = window.requestAnimationFrame(flush);
           }
           function onPointerDown(event) {
+            if (event.button === 0) pointerDown = true;
             var target = event.target;
             // 点浮层自己不算"点到别处"（否则按下就消失了，click 永远收不到）。
             if (target && target.closest && target.closest("[" + OWN_ATTR + "]")) return;
             setSelection(null);
           }
+          function onPointerUp(event) {
+            if (event.button !== 0) return;
+            pointerDown = false;
+            viaKeyboard = false;   // 鼠标一动手，上一次"键盘选区"的印记就作废
+            schedule();            // 拖完了才真正去读选区、决定出不出浮层
+          }
           function onKeyDown(event) {
-            if (event.key === "Escape") setSelection(null);
+            if (event.key === "Escape") { setSelection(null); return; }
+            viaKeyboard = true;
           }
           /**
            * 悬停胶囊 → 浮出原文。
@@ -1026,6 +1056,7 @@
           }
           document.addEventListener("mouseover", onChipOver, true);
           document.addEventListener("mouseout", onChipOut, true);
+          document.addEventListener("mouseup", onPointerUp, true);
           document.addEventListener("selectionchange", schedule);
           document.addEventListener("mousedown", onPointerDown, true);
           document.addEventListener("touchstart", onPointerDown, true);
@@ -1036,6 +1067,7 @@
             if (frame) window.cancelAnimationFrame(frame);
             document.removeEventListener("mouseover", onChipOver, true);
             document.removeEventListener("mouseout", onChipOut, true);
+            document.removeEventListener("mouseup", onPointerUp, true);
             document.removeEventListener("selectionchange", schedule);
             document.removeEventListener("mousedown", onPointerDown, true);
             document.removeEventListener("touchstart", onPointerDown, true);
