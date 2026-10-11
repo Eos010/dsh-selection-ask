@@ -516,10 +516,11 @@
        *   兜底退回纯文本是"看得见的行为降级"，必须能在控制台说清为什么 ——
        *   否则这类问题只会表现成"胶囊有时候不出来"，无从查起。
        */
-      function insertQuoteChip(record, sessionId, draft, draftRev) {
+      function insertQuoteChip(record, sessionId, draft, draftRev, at) {
         if (!ensureReferenceSource()) return "no-reference-source";
         var candidates = sessionScopes(sessionId);
         if (candidates.length === 0) return "no-session-scope";
+        var start = typeof at === "number" ? at : draft.length;
         var tried = [];
         for (var index = 0; index < candidates.length; index += 1) {
           var candidate = candidates[index];
@@ -544,8 +545,8 @@
                 appearance: "session",
                 clipboardText: quoteMarkdown(record.text)
               },
-              // 折叠 span：插在草稿末尾
-              span: { start: draft.length, end: draft.length, draftRev: draftRev }
+              // 折叠 span：默认插在草稿末尾，也允许点名位置（见 commit 里的顺序说明）
+              span: { start: start, end: start, draftRev: draftRev }
             });
             if (accepted === true) return null;
             tried.push(candidate.via + "=" + String(accepted));
@@ -556,6 +557,28 @@
         return "not-accepted(" + tried.join(", ") + ")";
       }
 
+      /**
+       * 往输入框插一段**纯文本**（批注走这条）。
+       *
+       * @returns {boolean} 被输入机接下才算成功（`bail` 返回 true）。
+       */
+      function insertNoteText(sessionId, text, at, draftRev) {
+        var candidates = sessionScopes(sessionId);
+        for (var index = 0; index < candidates.length; index += 1) {
+          if (typeof candidates[index].actx.bail !== "function") continue;
+          try {
+            var accepted = candidates[index].actx.bail("slash/input-insert-text", {
+              text: text,
+              span: { start: at, end: at, draftRev: draftRev }
+            });
+            if (accepted === true) return true;
+          } catch (error) {
+            console.error("[" + PACKAGE_ID + "] 插入批注文本失败：", error);
+            return false;
+          }
+        }
+        return false;
+      }
       /* ---------- portal 宿主：一个挂在 body 上的固定层 ---------- */
       var hostEl = null;
       function ensureHost() {
@@ -808,104 +831,80 @@
           var editor = findEditor(anchorRef.current);
           var record = registerQuote(picked.text);
 
-          var chipError = insertQuoteChip(record, sessionId, draft, draftRev);
-          var chipped = chipError === null;
+          var flash = function (text) {
+            setFlash({
+              text: picked.truncated ? T.truncated + "（" + picked.text.length + " 字）" : text,
+              anchor: picked.anchor
+            });
+            window.setTimeout(function () { setFlash(null); }, FLASH_MS);
+          };
 
-          if (!chipped) {
-            // 降级必须**出声**：这是一次看得见的行为变化，不是内部细节。
-            console.warn("[" + PACKAGE_ID + "] 胶囊插入未生效（" + chipError + "），退回纯文本引用。");
+          /** 降级必须**出声**：这是一次看得见的行为变化，不是内部细节。 */
+          var fallback = function (reason) {
+            console.warn("[" + PACKAGE_ID + "] 胶囊路径未生效（" + reason + "），退回纯文本引用。");
             if (!inputActions || typeof inputActions.setDraft !== "function") {
               console.error("[" + PACKAGE_ID + "] 插槽没有给出 inputActions.setDraft，无法写进输入框。");
               return;
             }
-            var fallback = note === "" ? block : block + "\n\n" + note;
             try {
-              inputActions.setDraft(composeDraft(draft, fallback));
+              inputActions.setDraft(composeDraft(draft, note === "" ? block : block + "\n\n" + note));
             } catch (error) {
               console.error("[" + PACKAGE_ID + "] 写入草稿失败：", error);
               return;
             }
-            // setDraft 之后光标位置由编辑器自己决定；这里把它推到末尾，
-            // 让"引用完接着写问题"这个动作不需要再用鼠标点一下。
             window.requestAnimationFrame(function () { caretToEnd(editor); });
-          } else {
-            if (note !== "") appendNote(note, draft, record);
-            window.requestAnimationFrame(function () { caretToEnd(editor); });
-          }
-
-          setFlash({
-            text: picked.truncated
-              ? T.truncated + "（" + picked.text.length + " 字）"
-              : (chipped ? chipLabel(record) : T.quoted),
-            anchor: picked.anchor
-          });
-          window.setTimeout(function () { setFlash(null); }, FLASH_MS);
-        }, [draft, draftRev, sessionId, inputActions, appendNote, T]);
-
-        /**
-         * 把批注接在胶囊后面。
-         *
-         * 这个动作**在胶囊落位之后**才能做：草稿是全文替换语义，先写批注再插胶囊
-         * 会把批注冲掉；而插胶囊会让草稿与修订号都变，所以必须等它变了再发。
-         *
-         * ⚠️ 两条踩出来的规矩（2026-10-11）：
-         *  1. **不用 `useEffect` 驱动。** effect 会在胶囊真正落位之前因为别的重渲染
-         *     先跑一次，拿旧修订号去发事件 —— span 的 CAS 过不去，而待办已经被消费掉，
-         *     于是永远不再重试。更阴的是 effect 的 cleanup 会在 `flash` 变化时
-         *     **静默取消**正在重试的 rAF，连告警都来不及打。所以改成从提交处直接起循环。
-         *  2. **判据是"事件被接下"（`bail` 返回 true），不是"草稿变了"。**
-         *     拿"草稿变了"当条件的话，一旦插胶囊没有改变 `useInput()` 报出来的投影
-         *     （完全可能：胶囊是 Lexical 的 decorator 节点），这个循环就永远等不到，
-         *     然后安静地放弃。改成"每帧都试着发一次，被接下就停"——CAS 自己会挑出
-         *     修订号对得上的那一帧。
-         */
-        var appendNote = React.useCallback(function (note, before, record) {
-          var scopes = sessionScopes(sessionId);
-          if (scopes.length === 0) {
-            console.warn("[" + PACKAGE_ID + "] 拿不到会话作用域，批注没能接在胶囊后面。");
-            return;
-          }
-          var actx = scopes[0].actx;
-          if (typeof actx.bail !== "function") {
-            console.warn("[" + PACKAGE_ID + "] 这个会话作用域没有 bail 派发，批注没能接上。");
-            return;
-          }
-          // 插入点有几个可能的坐标系，**逐个试**，让 `bail` 的返回值挑出对的那个：
-          //  · `InputState.draft` 是**剪贴板投影**（胶囊展开成 clipboardText）；
-          //  · 而 `insertText` 的 span 要的是**编辑坐标**，胶囊在那里的长度可能只算
-          //    它的 label（"选中文本 1"）。两者差 `clipLen - labelLen`。
-          //  与其猜，不如把候选都试一遍 —— 被接下的那个就是对的。
-          var delta = quoteMarkdown(record.text).length - chipLabel(record).length;
-          var attempt = function (tries) {
-            var now = latestRef.current;
-            var ends = [now.draft.length];
-            if (delta > 0 && now.draft.length >= delta) ends.push(now.draft.length - delta);
-            ends.push(before.length);
-            for (var index = 0; index < ends.length; index += 1) {
-              var end = ends[index];
-              if (end < 0 || end > now.draft.length) continue;
-              var accepted = false;
-              try {
-                accepted = actx.bail("slash/input-insert-text", {
-                  text: " " + note,
-                  span: { start: end, end: end, draftRev: now.draftRev }
-                }) === true;
-              } catch (error) {
-                console.error("[" + PACKAGE_ID + "] 批注没能接在胶囊后面：", error);
-                return;
-              }
-              if (accepted) return;
-            }
-            if (tries < 60) window.requestAnimationFrame(function () { attempt(tries + 1); });
-            else {
-              console.warn(
-                "[" + PACKAGE_ID + "] 批注始终没被输入机接下（草稿 " + before.length + " → " + now.draft.length
-                + "，候选插入点 " + JSON.stringify(ends) + "，delta " + delta + "）。"
-              );
-            }
+            flash(T.quoted);
           };
-          window.requestAnimationFrame(function () { attempt(0); });
-        }, [sessionId]);
+
+          if (quoteMarkdown(picked.text) === block) { /* 保持 block 已被使用，免得被优化掉 */ }
+
+          if (note === "") {
+            // 只有引用：直接插胶囊
+            var chipError = insertQuoteChip(record, sessionId, draft, draftRev);
+            if (chipError === null) {
+              window.requestAnimationFrame(function () { caretToEnd(editor); });
+              flash(chipLabel(record));
+            } else {
+              fallback(chipError);
+            }
+            return;
+          }
+
+          // ⚠️「引用 + 批注」的顺序很讲究：**先写批注，再把胶囊插在批注起点**。
+          //
+          // 实测（2026-10-11）：胶囊一进输入框，`insert-text` 的坐标空间里就只剩
+          // 位置 0 可用 —— 胶囊在**编辑坐标**里不占长度，而 `InputState.draft` 报的是
+          // **剪贴板投影**（另一个投影，胶囊在里面展开成 clipboardText）。
+          // 所以"先插胶囊、再往它后面补文本"永远补不到它后面（试过 9、6、0 三个
+          // 候选插入点，只有 0 被接受，批注就落到了胶囊前面）。
+          // 反过来做：批注先落（此时坐标是真实文本），胶囊再插在**批注起点**
+          // ⇒ 渲染出来正是 `[胶囊] 批注`。
+          var noteAt = draft.length;
+          if (!insertNoteText(sessionId, " " + note + " ", noteAt, draftRev)) {
+            fallback("note-text-rejected");
+            return;
+          }
+          var tries = 0;
+          var placeChip = function () {
+            tries += 1;
+            var now = latestRef.current;
+            // 位置用 `noteAt`（批注起点，插胶囊前算出来的），不是 now.draft.length ——
+            // 后者此刻已经把批注算进去了，会把胶囊插到批注后面去。
+            var error = insertQuoteChip(record, sessionId, now.draft, now.draftRev, noteAt);
+            if (error === null) {
+              window.requestAnimationFrame(function () { caretToEnd(editor); });
+              flash(chipLabel(record));
+              return;
+            }
+            if (tries < 60) {
+              window.requestAnimationFrame(placeChip);
+              return;
+            }
+            fallback("chip-" + error);
+          };
+          window.requestAnimationFrame(placeChip);
+        }, [draft, draftRev, sessionId, inputActions, T]);
+
 
         /**
          * 「侧边提问」：把这段文本交给右侧栏的独立对话。
@@ -1070,6 +1069,10 @@
     }
   };
 })();
+
+
+
+
 
 
 
