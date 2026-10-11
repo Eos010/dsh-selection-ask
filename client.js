@@ -413,6 +413,8 @@
       var quoteSeq = 0;
       var quoteByRef = new Map();
       var quoteByText = new Map();
+      /** 胶囊在 DOM 上只有 label（title="选中文本 1"），没有 ref —— 靠它反查。 */
+      var quoteByLabel = new Map();
 
       /** 给一段原文分配（或取回）它的编号记录。 */
       function registerQuote(text) {
@@ -422,6 +424,7 @@
         var record = { n: quoteSeq, text: text, ref: "q" + quoteSeq };
         quoteByRef.set(record.ref, record);
         quoteByText.set(text, record);
+        quoteByLabel.set(chipLabel(record), record);
         return record;
       }
 
@@ -630,6 +633,48 @@
         }, props.text);
       }
 
+      /* ---------- 悬停胶囊显示原文（参考图3） ---------- */
+      /**
+       * 胶囊是 DSH 自己渲染的（Lexical 的 decorator 节点），**改不了它内部结构**，
+       * 但可以在它上面挂监听，再用**我自己的浮层**显示原文。
+       *
+       * 命中方式：胶囊在 DOM 上带 `data-composer-chip="<引用源名>"`，里面的 `title`
+       * 就是 label（"选中文本 1"）—— 拿它反查登记处取原文。
+       * **不写死任何宿主类名**，宿主改样式表也不会让这条失效。
+       */
+      function ChipTip(props) {
+        var tip = props.tip;
+        var ref = React.useRef(null);
+        var posState = React.useState(null);
+        var pos = posState[0];
+        var setPos = posState[1];
+
+        React.useLayoutEffect(function () {
+          var el = ref.current;
+          if (!el) return;
+          var rect = el.getBoundingClientRect();
+          setPos(clampPosition(tip.anchor, {
+            width: rect.width,
+            height: rect.height
+          }, {
+            width: window.innerWidth,
+            height: window.innerHeight
+          }));
+        }, [tip]);
+
+        return h("div", {
+          ref: ref,
+          className: "dsa-chiptip",
+          "data-dsa": "chiptip",
+          role: "tooltip",
+          style: pos
+            ? { left: pos.left + "px", top: pos.top + "px" }
+            : { left: "0px", top: "0px", visibility: "hidden" }
+        }, [
+          h("div", { className: "dsa-chiptip__label", key: "label" }, tip.label),
+          h("div", { className: "dsa-chiptip__text", key: "text" }, tip.text)
+        ]);
+      }
       /* ---------- 浮层：一条就地输入栏（参考图4） ---------- */
       /**
        * 浮层从"两个按钮"变成"**一个输入框 + 两个动作**"：
@@ -747,6 +792,10 @@
         var anchorRef = React.useRef(null);
         var [selection, setSelection] = React.useState(null);
         var [flash, setFlash] = React.useState(null);
+        /** 悬停胶囊时浮出的原文预览（图3）。 */
+        var chipTipState = React.useState(null);
+        var chipTip = chipTipState[0];
+        var setChipTip = chipTipState[1];
         var inputActions = props ? props.inputActions : null;
         var useInput = props ? props.useInput : null;
         var sessionId = props ? props.sessionId : undefined;
@@ -794,6 +843,37 @@
           function onKeyDown(event) {
             if (event.key === "Escape") setSelection(null);
           }
+          /**
+           * 悬停胶囊 → 浮出原文。
+           *
+           * 用**事件委托**挂在 document 上，而不是挂在胶囊节点上：
+           * 胶囊是 Lexical 的 decorator 节点，编辑器每次重渲染都会重建它，
+           * 挂在节点上的监听会跟着掉。
+           */
+          function chipOf(target) {
+            return target && target.closest
+              ? target.closest('[data-composer-chip="' + REF_SOURCE + '"]')
+              : null;
+          }
+          function onChipOver(event) {
+            var chip = chipOf(event.target);
+            if (!chip) return;
+            var titled = chip.querySelector("[title]");
+            var label = titled ? titled.getAttribute("title") : chip.getAttribute("title");
+            var record = label ? quoteByLabel.get(label) : null;
+            if (!record) return;
+            var rect = chip.getBoundingClientRect();
+            setChipTip({
+              label: label,
+              text: record.text,
+              anchor: { left: rect.left, top: rect.top, width: rect.width, height: rect.height, bottom: rect.bottom }
+            });
+          }
+          function onChipOut(event) {
+            if (chipOf(event.target)) setChipTip(null);
+          }
+          document.addEventListener("mouseover", onChipOver, true);
+          document.addEventListener("mouseout", onChipOut, true);
           document.addEventListener("selectionchange", schedule);
           document.addEventListener("mousedown", onPointerDown, true);
           document.addEventListener("touchstart", onPointerDown, true);
@@ -802,6 +882,8 @@
           window.addEventListener("scroll", schedule, true);
           return function () {
             if (frame) window.cancelAnimationFrame(frame);
+            document.removeEventListener("mouseover", onChipOver, true);
+            document.removeEventListener("mouseout", onChipOut, true);
             document.removeEventListener("selectionchange", schedule);
             document.removeEventListener("mousedown", onPointerDown, true);
             document.removeEventListener("touchstart", onPointerDown, true);
@@ -844,6 +926,21 @@
             console.warn("[" + PACKAGE_ID + "] 胶囊路径未生效（" + reason + "），退回纯文本引用。");
             if (!inputActions || typeof inputActions.setDraft !== "function") {
               console.error("[" + PACKAGE_ID + "] 插槽没有给出 inputActions.setDraft，无法写进输入框。");
+              return;
+            }
+            // ⚠️ 草稿里已经有胶囊时**绝不能**调 setDraft。
+            //
+            // 它是**全文替换**语义：会把用户已经插好的那些胶囊一起抹掉。
+            // 2026-10-11 实测踩到：连续引用第二次时胶囊插入失败，兜底一跑，
+            // 第一个胶囊连带被删，看起来像"引用了两次只剩一次"。
+            // 宁可这次不引用（并且大声说出来），也不能毁掉已有内容。
+            var editorNow = findEditor(anchorRef.current);
+            var existing = editorNow ? editorNow.querySelectorAll("[data-composer-chip]").length : 0;
+            if (existing > 0) {
+              console.error(
+                "[" + PACKAGE_ID + "] 草稿里已有 " + existing + " 个胶囊，为避免抹掉它们，这次引用没有写入。"
+                + "请手动复制这段原文，或先清空输入框再试。"
+              );
               return;
             }
             try {
@@ -931,13 +1028,10 @@
           )
           : null;
 
-        if (flash) {
-          return h(React.Fragment, null, anchor, overlay, ReactDOM.createPortal(
-            h(Toast, { text: flash.text, anchor: flash.anchor }),
-            ensureHost()
-          ));
-        }
-        return h(React.Fragment, null, anchor, overlay);
+        var portals = [];
+        if (chipTip) portals.push(ReactDOM.createPortal(h(ChipTip, { tip: chipTip }), ensureHost()));
+        if (flash) portals.push(ReactDOM.createPortal(h(Toast, { text: flash.text, anchor: flash.anchor }), ensureHost()));
+        return h.apply(null, [React.Fragment, null, anchor, overlay].concat(portals));
       }
 
       /* ---------- 侧边提问：注册标签页类型与面板主体 ---------- */
@@ -1069,6 +1163,12 @@
     }
   };
 })();
+
+
+
+
+
+
 
 
 

@@ -400,6 +400,47 @@
   filter: brightness(1.06);
 }
 
+/* ── 悬停胶囊时的原文预览（参考图3） ── */
+
+.dsa-chiptip {
+  position: fixed;
+  z-index: 2147483000;
+  /* 预览只是"看一眼"，不该拦住任何点击，也不该抢走悬停 */
+  pointer-events: none;
+  max-width: min(420px, 60vw);
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--dsw-alias-border-l1, rgba(15, 17, 21, 0.06));
+  background: var(--dsw-specific-menu, var(--dsw-alias-bg-layer-3, #ffffff));
+  box-shadow: var(
+    --dsw-elevation-prominent,
+    0 3px 8px rgba(15, 17, 21, 0.06),
+    0 0 20px rgba(15, 17, 21, 0.05)
+  );
+  color: var(--dsw-alias-label-primary, #0f1115);
+  font-family: inherit;
+  -webkit-user-select: none;
+  user-select: none;
+  animation: dsa-toast-in 0.12s ease-out;
+}
+
+.dsa-chiptip__label {
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary, #61666b);
+  margin-bottom: 3px;
+}
+
+.dsa-chiptip__text {
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  /* 原文可能很长，最多看十行，再多没意义 */
+  max-height: 10.5em;
+  overflow: hidden;
+}
+
 /* ─────────── 兜底配色：宿主 token 全缺时的深色底 ─────────── */
 
 @media (prefers-color-scheme: dark) {

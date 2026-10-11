@@ -179,8 +179,10 @@ const selected = await cdp.evaluate(`
   const sel = window.getSelection();
   return { text: sel ? sel.toString().trim().slice(0, 60) : '', collapsed: sel ? sel.isCollapsed : true };
 `);
-check("浏览器里确实有了非折叠选区", !selected.collapsed && selected.text.length > 0, `选中「${selected.text}」`);
-
+// ⚠️ 不能读**实时**选区：就地输入栏一出现就会自动聚焦，而"聚焦 input"会让浏览器
+// 注：这里**不**断言实时选区 —— 就地输入栏一出现就自动聚焦，而"聚焦 input"会清空
+// 文档选区（这正是插件里 ownOverlayHasFocus 存在的原因）。"浮层出现了"本身就是
+// 插件读到了选区的证据。
 /* 4. 浮层出现，且带「引用到对话」按钮 */
 const toolbar = await cdp.evaluate(`
   const el = document.querySelector('[data-dsa="toolbar"]');
@@ -192,6 +194,7 @@ const toolbar = await cdp.evaluate(`
   const hit = document.elementFromPoint(cx, cy);
   return {
     label: button ? button.innerText.trim() : null,
+    buttonRect: button ? (() => { const br = button.getBoundingClientRect(); return { x: Math.round(br.left + br.width / 2), y: Math.round(br.top + br.height / 2) }; })() : { x: 0, y: 0 },
     ariaLabel: button ? button.getAttribute('aria-label') : null,
     position: getComputedStyle(el).position,
     pointerEvents: getComputedStyle(el).pointerEvents,
@@ -218,7 +221,9 @@ if (toolbar) { await shot("toolbar"); }
 
 /* 5. 点按钮 —— 同样是真实鼠标事件（先测 mousedown 不吞掉选区这条命脉） */
 if (toolbar) {
-  const center = { x: toolbar.rect.x + Math.round(toolbar.rect.w / 2), y: toolbar.rect.y + Math.round(toolbar.rect.h / 2) };
+  // ⚠️ 点**按钮自己**的中心，不是浮层中心 —— 浮层现在中间是就地输入栏，
+    //    点中心只会把焦点给输入框，按钮永远按不到（2026-10-11 实测踩到）。
+    const center = { x: toolbar.buttonRect.x, y: toolbar.buttonRect.y };
   await cdp.clickAt(center.x, center.y);
   await sleep(500);
 
@@ -243,6 +248,7 @@ if (toolbar) {
     return {
       draft,
       quoteLines: draft ? draft.split('\\n').filter((line) => line.trim().startsWith('>')).map((line) => line.trim()) : [],
+      chips: editor ? [...editor.querySelectorAll('[data-composer-chip]')].map((node) => ((node.querySelector('[title]') || node).getAttribute('title') || '').trim()) : [],
       toast: toast ? toast.innerText.trim() : null,
       toastRect: toast ? (() => { const r = toast.getBoundingClientRect(); return { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) }; })() : null,
       toastOverlapsComposer,
@@ -251,12 +257,8 @@ if (toolbar) {
   `);
 
   check("点完浮层收起", after.toolbarGone);
-  check("输入框里出现了引用块", Array.isArray(after.quoteLines) && after.quoteLines.length >= 1, JSON.stringify(after.draft ?? "").slice(0, 120));
-  check(
-    "引用行内容 = 选中的那段文字",
-    Array.isArray(after.quoteLines) && after.quoteLines.some((line) => line.includes(selected.text)),
-    `选中「${selected.text}」→ 引用行 ${JSON.stringify(after.quoteLines)}`
-  );
+  check("输入框里出现了引用胶囊", Array.isArray(after.chips) && after.chips.length >= 1, JSON.stringify(after.chips ?? []));
+  check("胶囊是 DSH 的原子引用节点（可见形态是编号，不是一段文本）", Array.isArray(after.chips) && after.chips.length > 0 && /\d/.test(after.chips[0]), JSON.stringify(after.chips ?? []));
   check("给了「已引用」反馈", after.toast !== null, after.toast);
   check("提示不压在输入框上（贴的是刚才那次选区）", after.toastOverlapsComposer === false, `toast=${JSON.stringify(after.toastRect)}`);
 
@@ -266,7 +268,7 @@ if (toolbar) {
   await cdp.dragSelect(target.from, target.to);
   await sleep(400);
   const second = await cdp.evaluate(`
-    const el = document.querySelector('[data-dsa="toolbar"]');
+    const el = document.querySelector('[data-dsa="quote"]');
     if (!el) return null;
     const rect = el.getBoundingClientRect();
     return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
@@ -274,22 +276,21 @@ if (toolbar) {
   if (second) {
     await cdp.clickAt(second.x, second.y);
     await sleep(500);
-    const twice = await cdp.evaluate(`
+    const twice = await cdp.evaluate(`{
       const editor = document.querySelector('[contenteditable="true"],[contenteditable=""]');
       if (!editor) return null;
       const blocks = [...editor.children];
-      return blocks.length > 0 ? blocks.map((node) => node.textContent).join('\\n') : editor.innerText;
-    `);
-    // 数"引用块"：连续以 `>` 开头的行算一块
-    const lines = typeof twice === "string" ? twice.split("\n") : [];
-    let blocks = 0;
-    let inside = false;
-    for (const line of lines) {
-      const isQuote = line.trim().startsWith(">");
-      if (isQuote && !inside) blocks += 1;
-      inside = isQuote;
-    }
-    check("连续引用两次 → 输入框里有两块独立引用（追加而不是覆盖）", blocks >= 2, `引用块数=${blocks}；草稿=${JSON.stringify(twice ?? "").slice(0, 160)}`);
+      return {
+        text: blocks.length > 0 ? blocks.map((node) => node.textContent).join('\\n') : editor.innerText,
+        chips: [...editor.querySelectorAll('[data-composer-chip]')].map((node) => ((node.querySelector('[title]') || node).getAttribute('title') || '').trim())
+      };
+    }`);
+    // 数胶囊 —— 引用现在是原子节点，不是一段以 ">" 开头的文本了
+    check(
+      "连续引用两次 → 输入框里有两个引用胶囊（追加而不是覆盖）",
+      twice && Array.isArray(twice.chips) && twice.chips.length >= 2,
+      `胶囊=${JSON.stringify(twice ? twice.chips : null)}`
+    );
   } else {
     check("第二次选中仍能出浮层", false, "浮层没再出现");
   }
@@ -406,4 +407,10 @@ if (cdp.pageErrors.length > 0) {
 }
 await cdp.close();
 process.exit(failed.length === 0 ? 0 : 1);
+
+
+
+
+
+
 
