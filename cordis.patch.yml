@@ -1,0 +1,10 @@
+# 本插件自带的 patch 层。
+#
+# 走 `dsh plugin --profile <name> add dsh-selection-ask`（或从 GitHub 装）时，
+# 安装器会把本包登记进 profile 的 `dsh.profile.bundles`，这一行 insert 就是靠那一步挂上去的。
+#
+# ⚠️ `name` 必须与 package.json 的 `name` 逐字相同 —— 不一致时 DSH 会在
+#    profile 装配阶段直接抛 `package identity is invalid for <name>`，起不来。
+- insert:
+    - id: selection-ask
+      name: dsh-selection-ask

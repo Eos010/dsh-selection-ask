@@ -1,0 +1,61 @@
+{
+  "name": "dsh-selection-ask",
+  "version": "0.1.0",
+  "description": "划词提问 —— 在 DeepSeek Harness 网页里选中任意文本，浮出一个小条，一键把它作为引用块加进输入框 / Select any text in the DeepSeek Harness web GUI and quote it into the composer in one click.",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "plugin",
+    "selection",
+    "quote",
+    "context",
+    "composer"
+  ],
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "client.js",
+    "selection-ask.css",
+    "build.mjs",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "test",
+    "docs",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node test/bundle.test.mjs && node test/selection.test.mjs",
+    "test:e2e": "node test/e2e/selection-ask.e2e.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Eos010/dsh-selection-ask.git"
+  },
+  "homepage": "https://github.com/Eos010/dsh-selection-ask#readme",
+  "bugs": {
+    "url": "https://github.com/Eos010/dsh-selection-ask/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}

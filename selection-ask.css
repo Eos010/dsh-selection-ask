@@ -1,0 +1,192 @@
+/*
+ * dsh-selection-ask —— 全部样式
+ *
+ * 配色一律走宿主的 design token，并带兜底值：
+ * 宿主浅色主题下就是浅色浮层、深色主题下就是深色浮层，插件不需要自己判断主题。
+ *
+ * ⚠️ 兜底值只在宿主 token 缺失时才生效。**写兜底值也要按"深色底 / 浅色底"两套走**
+ *   （见文件末尾的 `prefers-color-scheme: dark` 段），否则一旦 token 没了，
+ *   深色宿主上会出现"白底白字"。
+ *
+ * ⚠️ 对比度是量过的，不是估的（沿用 dsh-effort-slider 2026-10-07 的教训）：
+ *   正文小字用 `--dsw-alias-label-primary`，
+ *   **不要用 `--dsw-alias-label-tertiary`** —— 它在宿主自己的浅色底上只有 3.71:1，不够 4.5:1。
+ */
+
+/* ───────────────────────── 浮层本体 ───────────────────────── */
+
+.dsa-root {
+  position: fixed;
+  z-index: 2147483000;
+  /*
+   * ⚠️ 这一行是**必须**的，不是可选修饰。
+   *
+   * portal 宿主（body 下那个 div）设了 `pointer-events: none` —— 目的是让那一层
+   * 对页面完全透明。但 `pointer-events` 是**继承属性**：浮层不把 `auto` 设回来，
+   * 它就跟着一起变成"点击穿透"。
+   *
+   * 症状极具欺骗性：浮层**画得出来、位置也对**，但鼠标事件全部落到下面的正文上，
+   * 于是 mousedown 的"点到别处就收起"先把浮层收掉，click 永远到不了按钮 ——
+   * 表现为"点了没反应，浮层自己消失了"。
+   *
+   * 实测来源：2026-10-11 端到端验收（`elementFromPoint` 命中浮层下方的正文）。
+   */
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  box-sizing: border-box;
+  border-radius: 10px;
+  border: 1px solid var(--dsw-alias-border-l1, rgba(15, 17, 21, 0.06));
+  background: var(--dsw-specific-menu, var(--dsw-alias-bg-layer-3, #ffffff));
+  box-shadow: var(
+    --dsw-elevation-prominent,
+    0 3px 8px rgba(15, 17, 21, 0.06),
+    0 0 20px rgba(15, 17, 21, 0.05)
+  );
+  color: var(--dsw-alias-label-primary, #0f1115);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1;
+  /* 浮层自己不该被选中，也不该继承宿主的选择行为 */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  animation: dsa-pop 0.12s ease-out;
+}
+
+@keyframes dsa-pop {
+  from {
+    opacity: 0;
+    transform: translateY(3px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dsa-root {
+    animation: none;
+  }
+}
+
+/* ───────────────────────── 按钮 ───────────────────────── */
+
+.dsa-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 9px;
+  margin: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--dsw-alias-label-primary, #0f1115);
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  appearance: none;
+}
+
+.dsa-btn:hover {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(15, 17, 21, 0.06));
+}
+
+.dsa-btn:active {
+  background: var(--dsw-alias-interactive-bg-active, rgba(15, 17, 21, 0.09));
+}
+
+.dsa-btn:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary, #4a6cf7);
+  outline-offset: 1px;
+}
+
+.dsa-ico {
+  display: block;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  opacity: 0.85;
+}
+
+.dsa-btn:hover .dsa-ico {
+  opacity: 1;
+}
+
+/* ───────────────────────── 「已引用」提示 ───────────────────────── */
+
+/*
+ * 位置不写死 —— 由 Toast 组件量完自身尺寸后算出来（贴在刚才那次选区旁边）。
+ * 这里只负责外观。
+ */
+.dsa-toast {
+  position: fixed;
+  z-index: 2147483000;
+  pointer-events: none; /* 提示不拦截任何点击；它不是按钮 */
+  max-width: 60vw;
+  padding: 7px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--dsw-alias-border-l1, rgba(15, 17, 21, 0.06));
+  background: var(--dsw-specific-menu, var(--dsw-alias-bg-layer-3, #ffffff));
+  box-shadow: var(
+    --dsw-elevation-prominent,
+    0 3px 8px rgba(15, 17, 21, 0.06),
+    0 0 20px rgba(15, 17, 21, 0.05)
+  );
+  color: var(--dsw-alias-label-primary, #0f1115);
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  -webkit-user-select: none;
+  user-select: none;
+  animation: dsa-toast-in 0.14s ease-out;
+}
+
+@keyframes dsa-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dsa-toast {
+    animation: none;
+  }
+}
+
+/* ─────────── 兜底配色：宿主 token 全缺时的深色底 ─────────── */
+
+@media (prefers-color-scheme: dark) {
+  .dsa-root,
+  .dsa-toast {
+    background: var(--dsw-specific-menu, var(--dsw-alias-bg-layer-3, #353638));
+    color: var(--dsw-alias-label-primary, #e9edf6);
+    border-color: var(--dsw-alias-border-l1, rgba(255, 255, 255, 0.12));
+  }
+
+  .dsa-btn {
+    color: var(--dsw-alias-label-primary, #e9edf6);
+  }
+
+  .dsa-btn:hover {
+    background: var(--dsw-alias-interactive-bg-hover, rgba(255, 255, 255, 0.08));
+  }
+
+  .dsa-btn:active {
+    background: var(--dsw-alias-interactive-bg-active, rgba(255, 255, 255, 0.12));
+  }
+}

@@ -1,0 +1,8 @@
+# 一律用 LF：这个仓库里有"逐字节比对"的构建闸门（build.mjs 会断言内嵌 CSS
+# 与 selection-ask.css 一致），换行符在检出时被改写只会制造无谓的漂移。
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.webp binary
+*.ico binary

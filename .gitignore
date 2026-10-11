@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+
+# 开发脚手架（不进仓库）
+.scratch/
+.chrome-profile/
+.dev-probe.log
