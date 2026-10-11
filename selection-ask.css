@@ -453,6 +453,22 @@
   color: inherit;
 }
 
+/*
+ * ── 待定高亮：刚选中、浮层还开着的那一片 ──
+ *
+ * 为什么需要它：就地输入栏一出现就自动聚焦，而"聚焦一个 input"会让浏览器
+ * **当场清掉文档选区** —— 松手之后那片蓝色就没了，看起来就是"选完就消失"。
+ * 所以由这一层**接管**那一片：同族色，比"已标注"浅一档。
+ * 视觉上不是消失，是**换了个颜色**。
+ *
+ * 同样走 CSS Custom Highlight API（DOM 一个字节都不改），且用的是**活的 Range**——
+ * 只在浮层开着时存在，被重渲染打断就自动不画（它本来就是临时态）。
+ */
+::highlight(dsh-selection-ask-pending) {
+  background-color: color-mix(in srgb, var(--dsw-alias-brand-primary, #4a6cf7) 18%, transparent);
+  color: inherit;
+}
+
 /* 编号牌：放在我们自己的浮层里，按 Range 的位置贴上去，不插进正文 */
 .dsa-badge {
   position: fixed;

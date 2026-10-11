@@ -155,6 +155,37 @@
   }
 
   /**
+   * 从"登记处里的全部引用"里挑出**这一帧该画标注的**那些。
+   *
+   * 唯一事实源是**输入框里的胶囊**：
+   *
+   * ```
+   * 胶囊在    →  高亮在、编号在
+   * 胶囊没了  →  高亮走、编号走
+   * ```
+   *
+   * 为什么要有这一步：登记处、胶囊、原文标注原本是**三处各自活着的状态**，
+   * 在输入框里把胶囊删掉，另外两处根本不知道 —— 表现就是"删了引用，
+   * 原文的高亮和编号还赖着不走"（2026-10-11 他实测报的）。
+   *
+   * @param {Array<{n:number, text:string, ref:string}>} records 登记处里的全部记录
+   * @param {string[]|null} labels 输入框里现存的胶囊 label；**null ＝ 拿不到输入框**
+   * @param {(record:object) => string} labelOf 记录 → 胶囊 label
+   * @returns {Array<object>} 命中的记录，保持登记顺序
+   */
+  function liveQuoteRecords(records, labels, labelOf) {
+    var all = Array.isArray(records) ? records : [];
+    // 拿不到输入框（插槽还没挂上、会话还没开）时按"一条都没删"处理：
+    // 宁可多画几笔，也不要因为读不到宿主的 DOM 就把用户已经标注好的高亮全抹掉。
+    if (!Array.isArray(labels)) return all.slice();
+    var live = Object.create(null);
+    for (var index = 0; index < labels.length; index += 1) live[String(labels[index])] = true;
+    return all.filter(function (record) {
+      return live[String(labelOf(record))] === true;
+    });
+  }
+
+  /**
    * 这个节点是不是"不该触发浮层"的地方。
    *
    * 排除三类：
@@ -246,7 +277,11 @@
   /**
    * 读当前选区；不满足浮层条件时返回 null。
    *
-   * @returns {{text:string, truncated:boolean, anchor:object}|null}
+   * `range` 也一并带出去：浮层一出现就会自动聚焦，而"聚焦一个 input"会让浏览器
+   * **当场清掉文档选区** —— 那片蓝色看起来"凭空消失"。有了这个 Range，我们就能
+   * 用自己的待定高亮把它接管过来（见 `PENDING_KEY`）。
+   *
+   * @returns {{text:string, truncated:boolean, anchor:object, range:Range}|null}
    */
   function readSelection() {
     if (typeof window === "undefined" || !document.body) return null;
@@ -270,6 +305,8 @@
     return {
       text: text,
       truncated: truncated,
+      // 活的 DOM Range（不是字符偏移）—— 待定高亮直接用它，浮层开着这一会儿够用。
+      range: range,
       anchor: {
         left: rect.left,
         top: rect.top,
@@ -545,6 +582,31 @@
         var trimmed = base - chipClipTotal;
         if (chipClipTotal > 0 && trimmed >= 0 && trimmed !== base) spots.push(trimmed);
         spots.push(base);
+        /**
+         * 兜底阶梯：**有胶囊时，追加位置一定落在 0 … 胶囊数+1 这个小范围里**。
+         *
+         * 为什么必须有这一层（2026-10-11 实测）：`chipClipTotal` 累加的是
+         * `quoteMarkdown(text).length`（整段剪贴板文本），而 `InputState.draft`
+         * 是宿主自己的投影，两者**对不上**。一旦对不上，`base - chipClipTotal`
+         * 会变成负数被丢掉，于是候选里只剩 `base` —— 而 `base` 在"已经有胶囊"
+         * 时**一定被拒**（实测 `not-accepted(binding.ctx@19=undefined)`）。
+         * 结果：第二次引用静默失败，兜底又因为"草稿里已有胶囊"拒绝写入，
+         * 用户看到的是**点了没反应**。
+         *
+         * 实测的接受情况（无输入文字）：0 个胶囊 → 只有 0 被接受；
+         * 1 个胶囊 → 2；2 个胶囊 → 3。降序试 ⇒ 取到的是**最靠后的合法位置**，
+         * 也就是用户要的"追加"。
+         *
+         * ⚠️ 只在**已经有胶囊**时才加这一层：没有胶囊时 `base` 就是真实的文本
+         * 位置，拿小整数去试会把引用插到用户已经写好的问题**前面**去。
+         */
+        var chipLabels = liveChipLabels();
+        if (chipLabels && chipLabels.length >= 1) {
+          for (var back = chipLabels.length + 1; back >= 0; back -= 1) {
+            if (spots.indexOf(back) < 0) spots.push(back);
+          }
+        }
+        var tried = [];
         var tried = [];
         for (var index = 0; index < candidates.length; index += 1) {
           var candidate = candidates[index];
@@ -575,6 +637,8 @@
               });
               if (accepted === true) {
                 // 记下这个胶囊在剪贴板投影里占的长度，给下一个胶囊算插入点用
+                // （⚠️ 它只是**首选**候选：宿主投影与这里的算法并不总是对得上，
+                //    所以下面还有一层"小整数阶梯"兜底，见 spots 的构造）
                 chipClipTotal += quoteMarkdown(record.text).length;
                 return null;
               }
@@ -629,6 +693,14 @@
        * ② 引用的原文必须落在**单个文本节点**内（跨元素的选区锚不到）。
        */
       var HIGHLIGHT_KEY = "dsh-selection-ask";
+      /**
+       * 待定高亮用的键：**刚选中、浮层还开着**的那一片。
+       *
+       * 与"已标注"分开是必须的：待定那一片是**活的 DOM Range**（不按文字找回），
+       * 只在浮层开着时存在；而标注是按原文文字锚定的、长期存在。
+       * 两者同族不同深浅，视觉上"换了个颜色"，不是"选区消失了"。
+       */
+      var PENDING_KEY = "dsh-selection-ask-pending";
       // ⚠️ 必须显式写 `window.CSS`：本文件顶部有一个同名变量存着样式表文本，
       //    裸写 CSS 会命中那个字符串（作用域遮蔽），于是永远判定"不支持"。
       var highlightSupported = typeof window !== "undefined" && !!window.CSS
@@ -636,6 +708,53 @@
       var badgeLayer = null;
       var badgeEntries = [];
       var syncScheduled = 0;
+      /**
+       * 插槽里那个隐形锚点 —— 用它反查输入框，再看输入框里**现在还有哪些胶囊**。
+       * 由 `SelectionAskSlot` 的 ref 回调写进来（那里才知道自己的锚点在哪）。
+       */
+      var composerAnchor = null;
+      /** 当前这一次"待定"的选区（浮层开着时非空）。 */
+      var pendingRange = null;
+
+      /**
+       * 输入框里**现在**还有哪些胶囊。
+       *
+       * 这是"引用生命周期"的唯一事实源 —— 登记处记着"曾经引用过什么"，
+       * 而这里回答"此刻还留着什么"。
+       *
+       * @returns {string[]|null} label 数组；**null ＝ 读不出来**（拿不到输入框，
+       *   或者输入框里明明有胶囊却一个 label 都取不到 —— 那说明宿主换了结构，
+       *   这时宁可退回"都画"也不要误删用户的高亮）
+       */
+      function liveChipLabels() {
+        var editor = findEditor(composerAnchor);
+        if (!editor || typeof editor.querySelectorAll !== "function") return null;
+        var nodes = editor.querySelectorAll('[data-composer-chip="' + REF_SOURCE + '"]');
+        var labels = [];
+        for (var index = 0; index < nodes.length; index += 1) {
+          // 与悬停预览取 label 的方式**逐字相同**（`title` 在胶囊内部的节点上，
+          // 取不到时才退回胶囊自己）—— 两处判据不一致的话，会出现
+          // "悬停能看原文、但高亮判定说这个胶囊不存在"这种自相矛盾的行为。
+          var titled = nodes[index].querySelector ? nodes[index].querySelector("[title]") : null;
+          var label = titled ? titled.getAttribute("title") : nodes[index].getAttribute("title");
+          if (label) labels.push(label);
+        }
+        if (nodes.length > 0 && labels.length === 0) return null;
+        return labels;
+      }
+
+      /** 登记处 → 记录数组（保持登记顺序）。 */
+      function allQuoteRecords() {
+        var records = [];
+        quoteByRef.forEach(function (record) { records.push(record); });
+        return records;
+      }
+
+      /** 换一片"待定"选区（null ＝ 撤销待定）。与标注共用同一个调度器，不新增定时器。 */
+      function setPendingRange(range) {
+        pendingRange = range || null;
+        scheduleHighlightSync();
+      }
 
       /** 编号牌那一层：挂在已有的 portal 宿主里，跟浮层共用同一个层级。 */
       function ensureBadgeLayer() {
@@ -706,22 +825,43 @@
         }
       }
 
-      /** 重算高亮与编号牌。任何异常都吞掉 —— 标注失败绝不允许影响插件本体。 */
+      /**
+       * 重算高亮与编号牌。任何异常都吞掉 —— 标注失败绝不允许影响插件本体。
+       *
+       * 两件事，判据各归各的：
+       *  1. **标注** —— 只画"输入框里现存的胶囊"对应的原文（`liveChipLabels()`）。
+       *     胶囊被删掉之后一条都不画，连那次全页 TreeWalker 都省掉；
+       *  2. **待定** —— 浮层开着时，用更浅的同族色把刚选中的那片接管过来。
+       *     （浏览器原生选区在浮层自动聚焦的那一刻就被清掉了，不接管就是"消失"。）
+       */
       function syncHighlights() {
         if (!highlightSupported) return;
         try {
+          var records = liveQuoteRecords(allQuoteRecords(), liveChipLabels(), chipLabel);
           var highlight = new Highlight();
           badgeEntries = [];
-          quoteByRef.forEach(function (record) {
-            var range = findQuoteRange(record.text);
-            if (!range) return;
+          for (var index = 0; index < records.length; index += 1) {
+            var range = findQuoteRange(records[index].text);
+            if (!range) continue;
             highlight.add(range);
-            badgeEntries.push({ n: record.n, range: range });
-          });
+            badgeEntries.push({ n: records[index].n, range: range });
+          }
           window.CSS.highlights.set(HIGHLIGHT_KEY, highlight);
           placeBadges();
         } catch (error) {
           /* 标注是锦上添花，坏了不能连累引用本身 */
+        }
+        // 待定高亮**单独兜异常**：它画不出来，也绝不能让上面那层标注跟着一起没了。
+        try {
+          if (pendingRange) {
+            var pending = new Highlight();
+            pending.add(pendingRange);
+            window.CSS.highlights.set(PENDING_KEY, pending);
+          } else {
+            window.CSS.highlights.delete(PENDING_KEY);
+          }
+        } catch (error) {
+          /* 待定高亮是临时态，坏了就只是"刚选中那片没变色" */
         }
       }
 
@@ -964,6 +1104,17 @@
         var latestRef = React.useRef({ draft: "", draftRev: 0 });
         latestRef.current = { draft: draft, draftRev: draftRev };
 
+        /**
+         * 收起浮层 —— **必须连待定高亮一起撤销**。
+         *
+         * 这两件事在语义上是同一件："这次引用结束了"。分开写迟早会漏掉一处，
+         * 漏掉的那处表现成"浮层没了，但那片浅色高亮还赖在原文上"。
+         */
+        var closeSelection = React.useCallback(function () {
+          setSelection(null);
+          setPendingRange(null);
+        }, []);
+
         React.useEffect(function () {
           var frame = 0;
           /** 主键是否还按着 —— 按着就是"正在拖"，这时绝不能出浮层（见 flush）。 */
@@ -991,6 +1142,10 @@
               // 否则按着 Shift+方向键选字时也会被自己的浮层打断。
               next.autofocus = !viaKeyboard;
               setSelection(next);
+              // 松手那一刻，那片蓝色由**我们自己的待定高亮**接管 ——
+              // 浮层接下来会自动聚焦输入栏、把浏览器原生选区清掉，
+              // 有了这一层，视觉上就是"换了个颜色"，不是"选区凭空消失"。
+              setPendingRange(next.range);
               return;
             }
             // ⚠️ 空选区**不一定**该收起浮层。
@@ -1002,7 +1157,7 @@
             // 判据：焦点在我们自己的 DOM 里时，就不许因为"没选区"而收起。
             // 点别处仍然收起（那是 mousedown 那条路，见 onPointerDown）。
             if (ownOverlayHasFocus()) return;
-            setSelection(null);
+            closeSelection();
           }
           function schedule() {
             if (frame) return;
@@ -1013,7 +1168,7 @@
             var target = event.target;
             // 点浮层自己不算"点到别处"（否则按下就消失了，click 永远收不到）。
             if (target && target.closest && target.closest("[" + OWN_ATTR + "]")) return;
-            setSelection(null);
+            closeSelection();
           }
           function onPointerUp(event) {
             if (event.button !== 0) return;
@@ -1022,7 +1177,7 @@
             schedule();            // 拖完了才真正去读选区、决定出不出浮层
           }
           function onKeyDown(event) {
-            if (event.key === "Escape") { setSelection(null); return; }
+            if (event.key === "Escape") { closeSelection(); return; }
             viaKeyboard = true;
           }
           /**
@@ -1090,10 +1245,10 @@
          *    调一次就会把刚插进去的胶囊整个抹掉。所以批注交给
          *    re-render 之后的 effect，用「插入文本」事件接在胶囊后面。
          */
-        var commit = React.useCallback(function (picked, note) {
+        var commit = React.useCallback(function (picked, note, sendNow) {
           var block = quoteMarkdown(picked.text);
           if (block === "") return;
-          setSelection(null);
+          closeSelection();
           var editor = findEditor(anchorRef.current);
           var record = registerQuote(picked.text);
 
@@ -1197,7 +1352,7 @@
             fallback("chip-" + error);
           };
           window.requestAnimationFrame(placeChip);
-        }, [draft, draftRev, sessionId, inputActions, T]);
+        }, [draft, draftRev, sessionId, inputActions, T, closeSelection]);
 
 
         /**
@@ -1207,13 +1362,18 @@
          * 在就地输入栏里写了字的话，那段字成为侧边对话的**第一个问题**。
          */
         var ask = React.useCallback(function (picked, note) {
-          setSelection(null);
+          closeSelection();
           openAsk(picked, note);
-        }, [openAsk]);
+        }, [openAsk, closeSelection]);
 
         var anchor = h("span", {
           key: "anchor",
-          ref: anchorRef,
+          // 用 ref 回调而不是 useRef：锚点挂上/卸下的**那一刻**就要把它交给
+          // 高亮那一层（`composerAnchor`），否则第一次标注会算在"读不到输入框"上。
+          ref: function (node) {
+            anchorRef.current = node;
+            composerAnchor = node;
+          },
           "data-dsa": "anchor",
           style: { display: "none" }
         });
@@ -1345,7 +1505,9 @@
           window.removeEventListener("resize", scheduleHighlightSync);
           if (syncScheduled) { window.cancelAnimationFrame(syncScheduled); syncScheduled = 0; }
           try { window.CSS.highlights.delete(HIGHLIGHT_KEY); } catch (error) { /* 已经没了 */ }
+          try { window.CSS.highlights.delete(PENDING_KEY); } catch (error) { /* 已经没了 */ }
           badgeEntries = [];
+          pendingRange = null;
           if (badgeLayer && badgeLayer.parentElement) badgeLayer.parentElement.removeChild(badgeLayer);
           badgeLayer = null;
         };
@@ -1375,6 +1537,7 @@
     __internals: {
       quoteMarkdown: quoteMarkdown,
       composeDraft: composeDraft,
+      liveQuoteRecords: liveQuoteRecords,
       isExcludedNode: isExcludedNode,
       hasOpenModal: hasOpenModal,
       clampPosition: clampPosition,

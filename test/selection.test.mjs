@@ -18,7 +18,7 @@ import { loadBundle, el } from "./harness.mjs";
  */
 const bundle = loadBundle();
 const { module, dom } = bundle;
-const { quoteMarkdown, composeDraft, clampPosition, pickLang, isExcludedNode, hasOpenModal, STRINGS } = module.__internals;
+const { quoteMarkdown, composeDraft, liveQuoteRecords, clampPosition, pickLang, isExcludedNode, hasOpenModal, STRINGS } = module.__internals;
 
 /* ───────────────────────── 引用块 ───────────────────────── */
 
@@ -75,6 +75,60 @@ test("连续引用两次 → 两块引用之间只隔一个空行", () => {
 
 test("空引用块不改动草稿（只把尾随空白清掉）", () => {
   assert.equal(composeDraft("原文  ", ""), "原文");
+});
+
+/* ───────────────────── 引用的生命周期（高亮跟不跟胶囊走） ───────────────────── */
+
+/*
+ * 这一组是 2026-10-11 他实测报的那个问题的判据：
+ * 「在输入栏删掉文本后，原文高亮依旧保留，不会跟随删除。」
+ *
+ * 唯一事实源＝输入框里现存的胶囊。这里把"胶囊 → 该画哪几笔标注"的映射
+ * 抽成纯函数单测 —— 浏览器里那一半（真的去查 DOM）由 E2E 兜。
+ */
+
+const labelOf = (record) => `选中文本 ${record.n}`;
+const RECORDS = [
+  { n: 1, text: "第一段原文", ref: "q1" },
+  { n: 2, text: "第二段原文", ref: "q2" },
+  { n: 3, text: "第三段原文", ref: "q3" }
+];
+
+test("输入框里还有胶囊 → 只画它那一笔，其余不画", () => {
+  assert.deepEqual(liveQuoteRecords(RECORDS, ["选中文本 2"], labelOf), [RECORDS[1]]);
+});
+
+test("胶囊被删掉（label 列表为空）→ 一条都不画 —— 高亮与编号跟着走", () => {
+  assert.deepEqual(liveQuoteRecords(RECORDS, [], labelOf), []);
+});
+
+test("拿不到输入框（null）→ 全部照画：宁可多画几笔，也不要误删用户已有的标注", () => {
+  assert.deepEqual(liveQuoteRecords(RECORDS, null, labelOf), RECORDS);
+});
+
+test("只认得出来的那些：label 对不上任何记录 → 不画（不误画到别的引用上）", () => {
+  assert.deepEqual(liveQuoteRecords(RECORDS, ["选中文本 9"], labelOf), []);
+  assert.deepEqual(liveQuoteRecords(RECORDS, ["别的东西 1"], labelOf), []);
+});
+
+test("多个胶囊 → 全部命中，且保持登记顺序（编号牌的顺序必须稳定）", () => {
+  assert.deepEqual(liveQuoteRecords(RECORDS, ["选中文本 3", "选中文本 1"], labelOf), [RECORDS[0], RECORDS[2]]);
+  // 同一个 label 出现两次（正常不会，但真出现也不该画出两笔）
+  assert.deepEqual(liveQuoteRecords(RECORDS, ["选中文本 1", "选中文本 1"], labelOf), [RECORDS[0]]);
+});
+
+test("登记处空 / 入参不是数组 → 不抛，返回空", () => {
+  assert.deepEqual(liveQuoteRecords([], [], labelOf), []);
+  assert.deepEqual(liveQuoteRecords(null, [], labelOf), []);
+  assert.deepEqual(liveQuoteRecords(undefined, null, labelOf), []);
+});
+
+test("返回的是新数组，不改动入参（登记处不能被挑拣逻辑写坏）", () => {
+  const records = [{ n: 1, text: "x", ref: "q1" }];
+  const picked = liveQuoteRecords(records, null, labelOf);
+  assert.notEqual(picked, records);
+  picked.push({ n: 99, text: "注入", ref: "q99" });
+  assert.equal(records.length, 1);
 });
 
 /* ───────────────────────── 浮层落位 ───────────────────────── */

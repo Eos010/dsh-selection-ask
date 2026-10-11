@@ -109,18 +109,38 @@ export async function connect(options) {
     await send("Input.dispatchMouseEvent", { type: "mouseReleased", ...common, buttons: 0 });
   }
 
-  /** 真实拖拽选择：按下 → 分步移动 → 抬起，段落级选区才稳。 */
-  async function dragSelect(from, to) {
+  /**
+   * 真实拖拽选择：按下 → 分步移动 → 抬起。
+   *
+   * ⚠️ `steps` 与 `frameDelay` 不是装饰：**合成事件的"快"会掩盖所有"慢才会出问题"
+   * 的交互**。默认的 8 步零延迟，浏览器一瞬间就派发完了，任何"拖拽途中抢焦点 /
+   * 改选区"的 bug 都来不及发生 —— 2026-10-11 那个"拖不动字"的严重问题，
+   * 全绿的端到端验收一次都没抓到，就是因为这个。
+   * 要复现真人的手速，必须 `frameDelay: 16`（一帧一步，24 步≈400ms）。
+   *
+   * `onStep` 让调用方在**拖拽途中**观察页面状态（浮层有没有提前弹出、
+   * 选区有没有中途归零），这是唯一能看见"中途"的地方。
+   *
+   * @param {{x:number,y:number}} from 起点
+   * @param {{x:number,y:number}} to 终点
+   * @param {{steps?:number, frameDelay?:number, onStep?:Function}} [options]
+   */
+  async function dragSelect(from, to, options = {}) {
+    const steps = options.steps ?? 8;
+    const frameDelay = options.frameDelay ?? 0;
     await send("Input.dispatchMouseEvent", { type: "mousePressed", x: from.x, y: from.y, button: "left", clickCount: 1, buttons: 1 });
-    const steps = 8;
     for (let index = 1; index <= steps; index += 1) {
+      if (frameDelay > 0) await sleep(frameDelay);
+      const x = Math.round(from.x + ((to.x - from.x) * index) / steps);
+      const y = Math.round(from.y + ((to.y - from.y) * index) / steps);
       await send("Input.dispatchMouseEvent", {
         type: "mouseMoved",
-        x: Math.round(from.x + ((to.x - from.x) * index) / steps),
-        y: Math.round(from.y + ((to.y - from.y) * index) / steps),
+        x,
+        y,
         button: "left",
         buttons: 1
       });
+      if (options.onStep) await options.onStep({ index, steps, x, y });
     }
     await send("Input.dispatchMouseEvent", { type: "mouseReleased", x: to.x, y: to.y, button: "left", clickCount: 1, buttons: 0 });
   }

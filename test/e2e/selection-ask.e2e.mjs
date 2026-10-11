@@ -296,7 +296,120 @@ if (toolbar) {
   }
 }
 
-/* 7. 侧边提问：选中 → 点「侧边提问」→ 右侧栏开出面板 → 面板里带着刚才那段引用 */
+/* ═══════════════ 7. 引用的生命周期：待定高亮 → 标注高亮 → 删掉就一起走 ═══════════════ */
+/*
+ * 这一整段是 2026-10-11 那次修复的**常驻验收**，对应他实测报的两个问题：
+ *   ①「在输入栏删掉文本后，原文高亮依旧保留，不会跟随删除。」
+ *   ②「拖动选完之后蓝色的原生高亮框会消失。」
+ * 判据是"唯一事实源＝输入框里的胶囊"：胶囊在 ⇒ 高亮在、编号在；胶囊没了 ⇒ 两样都走。
+ */
+
+/** 两个高亮层的键名必须与 client.js 里逐字一致（写错会让断言静默失效，所以下面直接比对）。 */
+const HIGHLIGHT_KEY = "dsh-selection-ask";
+const PENDING_KEY = "dsh-selection-ask-pending";
+
+/** 一次读全四种状态：标注高亮、待定高亮、编号牌、输入框里的胶囊与浮层。 */
+const READ_HIGHLIGHT_STATE = `
+  const key = ${JSON.stringify(HIGHLIGHT_KEY)};
+  const pendingKey = ${JSON.stringify(PENDING_KEY)};
+  const sizeOf = (name) => {
+    const registry = window.CSS && window.CSS.highlights;
+    const layer = registry ? registry.get(name) : null;
+    return layer ? layer.size : 0;
+  };
+  const editor = document.querySelector('[contenteditable="true"],[contenteditable=""]');
+  const chips = editor ? [...editor.querySelectorAll('[data-composer-chip]')] : null;
+  return {
+    annotation: sizeOf(key),
+    pending: sizeOf(pendingKey),
+    badges: document.querySelectorAll('[data-dsa="badge"]').length,
+    badgeText: [...document.querySelectorAll('[data-dsa="badge"]')].map((node) => node.textContent).join(','),
+    chipCount: chips ? chips.length : -1,
+    chipLabel: chips && chips.length
+      ? ((chips[0].querySelector('[title]') || chips[0]).getAttribute('title') || '')
+      : null,
+    toolbar: !!document.querySelector('[data-dsa="toolbar"]')
+  };
+`;
+
+await clearComposer();
+await sleep(200);
+const beforeSlow = await cdp.evaluate(READ_HIGHLIGHT_STATE);
+check("起跑状态干净：没有胶囊、没有标注、没有待定高亮",
+  beforeSlow.chipCount === 0 && beforeSlow.annotation === 0 && beforeSlow.pending === 0,
+  `chips=${beforeSlow.chipCount} annotation=${beforeSlow.annotation} pending=${beforeSlow.pending}`);
+
+/* 7a. 慢速拖拽 —— 24 步、每步隔一帧（≈ 真人手速）。
+      这一条把 2026-10-11 那个"拖不动字"的复现手法**固化成常驻断言**：
+      合成事件一瞬间派发完时，浮层来不及抢焦点，什么 bug 都看不出来。 */
+const midDrag = [];
+await cdp.dragSelect(target.from, target.to, {
+  steps: 24,
+  frameDelay: 16,
+  onStep: async ({ index }) => {
+    const snapshot = await cdp.evaluate(`
+      const sel = window.getSelection();
+      return {
+        length: sel ? sel.toString().length : 0,
+        toolbar: !!document.querySelector('[data-dsa="toolbar"]')
+      };
+    `);
+    midDrag.push({ index, ...snapshot });
+  }
+});
+await sleep(400);
+
+// 前 3 步还没拖进文字里，选区本来就可能是空的 —— 从第 4 步起才要求"一直有选区"。
+const brokeEarly = midDrag.filter((item) => item.index > 3 && item.length === 0);
+const poppedEarly = midDrag.filter((item) => item.toolbar);
+check("慢速拖拽中途选区没被打断（拖得动字）", brokeEarly.length === 0,
+  brokeEarly.length ? `第 ${brokeEarly[0].index} 步断了：${JSON.stringify(brokeEarly[0])}` : `${midDrag.length} 步全程有选区`);
+check("慢速拖拽途中不出浮层（出浮层＝抢焦点＝拖不动字）", poppedEarly.length === 0,
+  poppedEarly.length ? `第 ${poppedEarly[0].index} 步就弹了` : "全程未弹出");
+
+const afterSlowDrag = await cdp.evaluate(READ_HIGHLIGHT_STATE);
+check("松手之后才出浮层", afterSlowDrag.toolbar === true);
+check("松手后那片选区由待定高亮接管（不是凭空消失）", afterSlowDrag.pending === 1, `pending=${afterSlowDrag.pending}`);
+check("还没提交引用 → 没有标注高亮、也没有编号牌",
+  afterSlowDrag.annotation === 0 && afterSlowDrag.badges === 0,
+  `annotation=${afterSlowDrag.annotation} badges=${afterSlowDrag.badges}`);
+
+await shot("pending");
+
+/* 7b. 提交这次引用 → 待定高亮交给标注高亮接管 */
+const slowQuote = await cdp.evaluate(`
+  const button = document.querySelector('[data-dsa="quote"]');
+  if (!button) return null;
+  const rect = button.getBoundingClientRect();
+  return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+`);
+if (slowQuote) {
+  await cdp.clickAt(slowQuote.x, slowQuote.y);
+  await sleep(700);
+  const quoted = await cdp.evaluate(READ_HIGHLIGHT_STATE);
+  const badgeNumber = String(quoted.badgeText);
+  const chipNumber = String(quoted.chipLabel || "").match(/\d+/);
+  check("提交后：输入框里出现 1 个胶囊", quoted.chipCount === 1, `chips=${quoted.chipCount}`);
+  check("提交后：原文出现标注高亮", quoted.annotation === 1, `annotation=${quoted.annotation}`);
+  check("提交后：原文出现编号牌，且号与胶囊上的号一致",
+    quoted.badges === 1 && /^\d+$/.test(badgeNumber) && !!chipNumber && badgeNumber === chipNumber[0],
+    `badge=${badgeNumber} chip=${JSON.stringify(quoted.chipLabel)}`);
+  check("提交后：待定高亮归 0（那片被标注接管，不是重叠着两份）", quoted.pending === 0, `pending=${quoted.pending}`);
+
+  await shot("annotated");
+
+  /* 7c. 在输入框里把胶囊删掉 —— 高亮与编号必须跟着走（他实测报的那个问题） */
+  await clearComposer();
+  await sleep(500);
+  const cleared = await cdp.evaluate(READ_HIGHLIGHT_STATE);
+  check("删掉胶囊后：输入框里确实没有胶囊了", cleared.chipCount === 0, `chips=${cleared.chipCount}`);
+  check("删掉胶囊后：原文的标注高亮同时消失", cleared.annotation === 0, `annotation=${cleared.annotation}`);
+  check("删掉胶囊后：编号牌同时消失", cleared.badges === 0, `badges=${cleared.badges}`);
+} else {
+  check("慢速拖拽后浮层里有「引用」按钮", false, "按钮找不到");
+}
+
+/* ═══════════════ 9. 侧边提问：选中 → 点「侧边提问」→ 右侧栏开出面板 ═══════════════ */
 await clearComposer();
 await cdp.dragSelect(target.from, target.to);
 await sleep(400);
@@ -340,7 +453,7 @@ if (askButton) {
   }
 }
 
-/* 8. 在面板里问一句：回答必须真的长出来，而且**不能进主对话** */
+/* 10. 在面板里问一句：回答必须真的长出来，而且**不能进主对话** */
 if (panel && panel.inputRect) {
   const draftBefore = await cdp.evaluate(READ_DRAFT);
   await cdp.clickAt(panel.inputRect.x, panel.inputRect.y);
@@ -398,7 +511,104 @@ if (panel && panel.inputRect) {
   }
 }
 
+/* ═══════════════ 11. 直接发送（Ctrl/Cmd + Enter）═══════════════ */
+/*
+ * 为什么这条必须有：在此之前"直发"**一行断言都没有**，而它其实是坏的 ——
+ * `flash()` 里引用了 `sendNow`，那个名字从来没被声明过（回调签名只有两个参数），
+ * 于是每次提交都抛 ReferenceError，直发那一步**永远走不到**。
+ * 页面看上去一切正常（胶囊插进去了、提示也弹了），只有"消息不发出去"。
+ *
+ * 判据用**内容**而不是计数：在就地输入栏里打一段独一无二的字，
+ * 直发之后它必须出现在**正文里**（输入框已清空 ⇒ 只可能来自转录）。
+ */
+{
+  await clearComposer();
+  await sleep(300);
+
+  const probeTarget = await cdp.evaluate(`
+    const isVisible = (node) => {
+      const rect = node.getBoundingClientRect();
+      if (rect.width < 120 || rect.height < 10 || rect.height > 500) return false;
+      if (rect.top < 8 || rect.bottom > window.innerHeight - 8) return false;
+      const hit = document.elementFromPoint(Math.round(rect.left + rect.width / 2), Math.round(rect.top + rect.height / 2));
+      return !!hit && (node.contains(hit) || hit.contains(node));
+    };
+    const node = [...document.querySelectorAll('p,li')]
+      .filter((n) => (n.innerText || '').trim().length >= 24)
+      .filter((n) => n.getBoundingClientRect().left > 280)
+      .filter(isVisible)[0] || null;
+    if (!node) return null;
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    const line = [...range.getClientRects()].filter((r) => r.width > 40 && r.height > 6)[0];
+    if (!line) return null;
+    const y = Math.round(line.top + line.height / 2);
+    return { from: { x: Math.round(line.left + 3), y }, to: { x: Math.round(line.right - 3), y } };
+  `);
+
+  const MARKER = "直发验收标记";
+  if (!probeTarget) {
+    check("直发验收：页面上找得到可拖拽的正文", false, "没有可选中的段落");
+  } else {
+    await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x: probeTarget.from.x, y: probeTarget.from.y, button: "left", clickCount: 1, buttons: 1 });
+    for (let index = 1; index <= 8; index += 1) {
+      await cdp.send("Input.dispatchMouseEvent", {
+        type: "mouseMoved",
+        x: Math.round(probeTarget.from.x + ((probeTarget.to.x - probeTarget.from.x) * index) / 8),
+        y: probeTarget.from.y,
+        button: "left",
+        buttons: 1
+      });
+    }
+    await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: probeTarget.to.x, y: probeTarget.to.y, button: "left", clickCount: 1, buttons: 0 });
+    await sleep(450);
+
+    const noteFocused = await cdp.evaluate(`
+      const note = document.querySelector('[data-dsa="note"]');
+      return !!note && document.activeElement === note;
+    `);
+    check("就地输入栏出现并已聚焦（选中→直接打字）", noteFocused === true);
+
+    if (noteFocused) {
+      await cdp.send("Input.insertText", { text: MARKER });
+      await sleep(250);
+      // Ctrl + Enter = 写进输入框并**立刻发出去**（普通 Enter 只写不发）
+      for (const type of ["keyDown", "keyUp"]) {
+        await cdp.send("Input.dispatchKeyEvent", {
+          type, key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, modifiers: 2
+        });
+      }
+      await sleep(2500);
+
+      const sent = await cdp.evaluate(`
+        const editor = document.querySelector('[contenteditable="true"],[contenteditable=""]');
+        const blocks = editor ? [...editor.children] : [];
+        return {
+          draft: editor ? (blocks.length ? blocks.map((node) => node.textContent).join('\\n') : editor.innerText) : null,
+          chips: editor ? editor.querySelectorAll('[data-composer-chip]').length : -1,
+          inTranscript: document.body.innerText.includes(${JSON.stringify(MARKER)}),
+          toolbar: !!document.querySelector('[data-dsa="toolbar"]')
+        };
+      `);
+      check("直发之后输入框被清空（消息真的出去了）", sent.chips === 0 && String(sent.draft).trim() === "", `chips=${sent.chips} draft=${JSON.stringify(String(sent.draft).slice(0, 30))}`);
+      check("直发之后那条消息出现在正文里（主对话里多了一轮）", sent.inTranscript === true);
+      check("直发之后浮层收起", sent.toolbar === false);
+    } else {
+      check("直发验收：就地输入栏拿到了焦点", false, "浮层没出现或没聚焦");
+    }
+  }
+}
+
 /* ───────────────────────────── 汇总 ───────────────────────────── */
+
+/*
+ * 收尾先验一条"整轮没有未捕获异常"。
+ *
+ * 它是量具的**保险丝**：只在事件回调里抛的 ReferenceError，页面看着一切正常，
+ * 坏掉的只是那一个动作。2026-10-11 顺手发现的 `sendNow` 未声明（Ctrl/Cmd+Enter
+ * 直发永远不发）就是这一类 —— 只断言"点了按钮有反应"的话，一辈子抓不到。
+ */
+check("整轮验收没有未捕获异常", cdp.pageErrors.length === 0, cdp.pageErrors[0] ?? "0");
 
 const failed = results.filter((item) => !item.ok);
 process.stdout.write(`\n${results.length - failed.length}/${results.length} 通过\n`);
