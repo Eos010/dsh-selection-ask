@@ -45,35 +45,51 @@ each becomes its own block, separated by a single blank line.
 
 ## Install
 
-```bash
-# From GitHub (the repo ships a prebuilt lib/client.js — no build step for you)
-dsh plugin --profile desktop add github:Eos010/dsh-selection-ask
+⚠️ One correction first (several plugin docs get this wrong): **the DSH CLI refuses
+`--profile desktop` outright** —
 
-# From a local working copy (use this while editing the source)
-dsh plugin --profile desktop add file:D:\Work\dsh-selection-ask
+```
+$ dsh plugin --profile desktop add github:Eos010/dsh-selection-ask
+error: profile "desktop" is managed exclusively by the Electron application
 ```
 
-> Replace `desktop` with the profile you actually run (the desktop app uses
-> `desktop`; `dsh web` uses `web`).
+The desktop profile is owned exclusively by the Electron app. Pick the path that
+matches what you actually run:
 
-**Restart DSH once afterwards**, then reload the page (`Ctrl+F5`).
+### Desktop app (Electron)
 
-That one restart is required because `dsh plugin add` registers the package in the
+Install from inside the DSH app. Or do it by hand in two steps — **this exact
+sequence was verified end to end**:
+
+```powershell
+# 1) Put the repo into the profile's node_modules
+git clone https://github.com/Eos010/dsh-selection-ask `
+  "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\dsh-selection-ask"
+
+# 2) Add one line to dsh.profile.bundles in ~/.dsh/profiles/desktop/package.json:
+#      "dsh-selection-ask"
+
+# 3) Restart DSH, then reload the page (Ctrl+F5)
+```
+
+### Command line (`dsh web`)
+
+```bash
+npm i -g pnpm        # dsh plugin is a pnpm forwarder; pnpm must be on PATH
+dsh plugin --profile web add github:Eos010/dsh-selection-ask
+```
+
+(For a local working copy, swap `github:…` for `file:D:\Work\dsh-selection-ask`.)
+
+**Either way, restart DSH once afterwards**, then reload the page (`Ctrl+F5`).
+
+That one restart is required because installing registers the package in the
 profile's `dsh.profile.bundles`, and that list is only read at startup. After the
 restart you are in hot-reload territory: editing `lib/client.js` swaps the running
 plugin within ~500 ms — no restart, no page reload (see *Development* below).
 
-Uninstall:
-
-```bash
-dsh plugin --profile desktop remove dsh-selection-ask
-```
-
-(If `dsh-selection-ask` is still listed in the profile's
-`dsh.profile.bundles`, drop that line too, then restart.)
-
----
-
+Uninstalling is the reverse: drop the line from `dsh.profile.bundles`, delete the
+directory under `node_modules`, restart.
 ## Usage
 
 1. **Select a passage** in the web GUI — an AI answer, your own message, tool

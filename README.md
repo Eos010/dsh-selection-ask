@@ -40,30 +40,46 @@
 
 ## 安装
 
-```bash
-# 从 GitHub 装（仓库自带构建好的 lib/client.js，装完即可用，不需要自己构建）
-dsh plugin --profile desktop add github:Eos010/dsh-selection-ask
+⚠️ 先纠一个坑（不少插件文档在这里是错的）：**DSH 的 CLI 会直接拒绝 `--profile desktop`** ——
 
-# 从本地工作副本装（改完源码用这条）
-dsh plugin --profile desktop add file:D:\Work\dsh-selection-ask
+```
+$ dsh plugin --profile desktop add github:Eos010/dsh-selection-ask
+error: profile "desktop" is managed exclusively by the Electron application
 ```
 
-> `--profile` 后面填你实际在用的 profile 名（桌面版是 `desktop`，命令行 `dsh web` 是 `web`）。
+桌面版的 profile 由 Electron 应用独占管理。所以按你实际在用的版本二选一：
 
-**装完要重启一次 DSH**，然后刷新网页（`Ctrl+F5`）。
+### 桌面版（Electron 应用）
 
-为什么必须重启这一次：`dsh plugin add` 会把本包登记进 profile 的 `dsh.profile.bundles`，
+在 DSH 应用内安装。也可以手动两步（**下面这套是实测跑通过的**）：
+
+```powershell
+# 1) 把仓库放进 profile 的 node_modules
+git clone https://github.com/Eos010/dsh-selection-ask `
+  "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\dsh-selection-ask"
+
+# 2) 在 ~/.dsh/profiles/desktop/package.json 的 dsh.profile.bundles 数组里加一行：
+#      "dsh-selection-ask"
+
+# 3) 重启 DSH，然后刷新网页（Ctrl+F5）
+```
+
+### 命令行版 `dsh web`
+
+```bash
+npm i -g pnpm        # dsh plugin 是 pnpm 的转发器，PATH 上得先有 pnpm
+dsh plugin --profile web add github:Eos010/dsh-selection-ask
+```
+
+（从本地工作副本装，就把 `github:…` 换成 `file:D:\Work\dsh-selection-ask`。）
+
+**两种方式装完都要重启一次 DSH**，然后刷新网页（`Ctrl+F5`）。
+
+为什么必须重启这一次：安装会把本包登记进 profile 的 `dsh.profile.bundles`，
 而那个清单**只在启动时读一次**。重启之后就进入热更新状态了 —— 改 `lib/client.js` 会在
 约 500ms 内自动换进正在运行的页面，不用再重启、也不用刷新（见下面「开发」一节）。
 
-卸载：
-
-```bash
-dsh plugin --profile desktop remove dsh-selection-ask
-```
-
-（若 profile 的 `package.json` 里 `dsh.profile.bundles` 还留着 `dsh-selection-ask` 那一行，一并删掉，再重启。）
-
+卸载就是反过来：从 `dsh.profile.bundles` 删掉那一行、删掉 `node_modules` 下的目录，重启。
 ---
 
 ## 用法
