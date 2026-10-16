@@ -565,11 +565,38 @@ if (panel && panel.inputRect) {
 
     const noteFocused = await cdp.evaluate(`
       const note = document.querySelector('[data-dsa="note"]');
-      return !!note && document.activeElement === note;
+      return {
+        exists: !!note,
+        focused: !!note && document.activeElement === note,
+        selText: String(window.getSelection() ? window.getSelection().toString() : "")
+      };
     `);
-    check("就地输入栏出现并已聚焦（选中→直接打字）", noteFocused === true);
+    /*
+     * ⚠️ 2026-10-16 反转的断言：浮层出现时**不该**抢焦点。
+     *
+     * 原来这里断言的是"就地输入栏出现并已聚焦"。但"聚焦一个 input"会让浏览器
+     * **当场清掉文档选区** —— 于是松手后 Ctrl+C 什么也复制不到（他实测报的）。
+     * 现在改成：焦点留在正文，**第一次敲键**时才搬进批注框（下一个断言的判据）。
+     */
+    check("浮层出现时不抢焦点（Ctrl+C 仍作用于文档选区）",
+      noteFocused.exists && noteFocused.focused === false,
+      `focused=${noteFocused.focused} 文档选区长度=${noteFocused.selText.length}`);
 
-    if (noteFocused) {
+    if (noteFocused.exists) {
+      // 先敲一个字：焦点应当被搬进批注框，且这个字写进去了
+      await cdp.send("Input.dispatchKeyEvent", { type: "keyDown", key: "A", code: "KeyA", windowsVirtualKeyCode: 65, text: "A" });
+      await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: "A", code: "KeyA", windowsVirtualKeyCode: 65 });
+      await sleep(200);
+      const afterType = await cdp.evaluate(`
+        const note = document.querySelector('[data-dsa="note"]');
+        return {
+          focused: !!note && document.activeElement === note,
+          value: note ? note.value : null
+        };
+      `);
+      check("敲下第一个字时才聚焦批注框，且这个字进了批注", afterType.focused === true && String(afterType.value).includes("A"),
+        `focused=${afterType.focused} value=${JSON.stringify(afterType.value)}`);
+
       await cdp.send("Input.insertText", { text: MARKER });
       await sleep(250);
       // Ctrl + Enter = 写进输入框并**立刻发出去**（普通 Enter 只写不发）
@@ -594,8 +621,484 @@ if (panel && panel.inputRect) {
       check("直发之后那条消息出现在正文里（主对话里多了一轮）", sent.inTranscript === true);
       check("直发之后浮层收起", sent.toolbar === false);
     } else {
-      check("直发验收：就地输入栏拿到了焦点", false, "浮层没出现或没聚焦");
+      check("直发验收：就地输入栏出现", false, "浮层没出现");
     }
+  }
+}
+
+/* ═══════════ 12. 绿色高亮（读像素，不是读注册表）═══════════ */
+/*
+ * ⚠️ 这一条是 2026-10-16 那轮的直接产物，也是**唯一**能抓到"颜色不对"的量具。
+ *
+ * 为什么前面的 `CSS.highlights` 尺寸断言抓不到：它读的是**注册表**（我们确实
+ * 把 Range 加进去了，size 永远是对的），而"画出来是什么颜色、有没有被原生选区
+ * 盖住"是**绘制层**的事 —— CSSWG 已裁定自定义高亮永远画在原生选区之下
+ * （csswg-drafts#4595），注册表对此一无所知。所以这里改成**截像素**：
+ * 取高亮矩形中心的实际颜色，判它是不是绿的。
+ *
+ * 判据：绿色通道明显高于红色通道（蓝色高亮是反过来的）。
+ */
+async function sampleColor(rect) {
+  if (!rect) return null;
+  const data = await cdp.send("Page.captureScreenshot", {
+    format: "png",
+    clip: { x: rect.x, y: rect.y, width: Math.max(2, rect.width), height: Math.max(2, rect.height), scale: 1 }
+  });
+  const base64 = data.data;
+  // 只解 PNG 的 IHDR + 像素太麻烦；改用页面侧解码：把截图贴进 canvas 读中心点
+  return await cdp.evaluate(`
+    (async () => {
+      const img = new Image();
+      img.src = "data:image/png;base64," + ${JSON.stringify(base64)};
+      await img.decode();
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width; canvas.height = img.height;
+      const ctx2d = canvas.getContext('2d');
+      ctx2d.drawImage(img, 0, 0);
+      const px = ctx2d.getImageData(Math.floor(img.width / 2), Math.floor(img.height / 2), 1, 1).data;
+      return { r: px[0], g: px[1], b: px[2], a: px[3] };
+    })()
+  `);
+}
+
+{
+  await clearComposer();
+  await sleep(300);
+
+  const colorTarget = await cdp.evaluate(`
+    const node = [...document.querySelectorAll('p,li')]
+      .filter((n) => (n.innerText || '').trim().length >= 24)
+      .filter((n) => n.getBoundingClientRect().left > 280)[0] || null;
+    if (!node) return null;
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    const line = [...range.getClientRects()].filter((r) => r.width > 80 && r.height > 6)[0];
+    if (!line) return null;
+    const y = Math.round(line.top + line.height / 2);
+    return { from: { x: Math.round(line.left + 3), y }, to: { x: Math.round(line.right - 3), y } };
+  `);
+
+  if (!colorTarget) {
+    check("绿色验收：页面上找得到可拖拽的正文", false, "没有可选中的段落");
+  } else {
+    await cdp.dragSelect(colorTarget.from, colorTarget.to, { steps: 8, frameDelay: 16 });
+    await sleep(500);
+
+    // 待定态：原生选区还活着 —— 这时用户看到的必须是绿，不是浏览器的蓝
+    const pendingRect = await cdp.evaluate(`
+      const layer = window.CSS && window.CSS.highlights ? window.CSS.highlights.get('dsh-selection-ask-pending') : null;
+      const ranges = layer ? [...layer] : [];
+      if (!ranges.length) return null;
+      const r = ranges[0].getBoundingClientRect();
+      return { x: Math.round(r.left + 2), y: Math.round(r.top + Math.floor(r.height / 2)), width: Math.max(4, Math.round(r.width) - 4), height: 2 };
+    `);
+    const pendingColor = await sampleColor(pendingRect);
+    check("松手后那片是**绿色**（不是原生选区的蓝）",
+      !!pendingColor && pendingColor.g > pendingColor.b + 12 && pendingColor.g > pendingColor.r + 12,
+      pendingColor ? `rgb(${pendingColor.r},${pendingColor.g},${pendingColor.b})` : "取不到待定高亮矩形");
+
+    // 提交，再看已标注那层
+    const quoteButton = await cdp.evaluate(`
+      const el = document.querySelector('[data-dsa="quote"]');
+      if (!el) return null;
+      const rect = el.getBoundingClientRect();
+      return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+    `);
+    if (quoteButton) {
+      await cdp.clickAt(quoteButton.x, quoteButton.y);
+      await sleep(800);
+      const annotatedRect = await cdp.evaluate(`
+        const layer = window.CSS && window.CSS.highlights ? window.CSS.highlights.get('dsh-selection-ask') : null;
+        const ranges = layer ? [...layer] : [];
+        if (!ranges.length) return null;
+        const r = ranges[0].getBoundingClientRect();
+        return { x: Math.round(r.left + 2), y: Math.round(r.top + Math.floor(r.height / 2)), width: Math.max(4, Math.round(r.width) - 4), height: 2 };
+      `);
+      const annotatedColor = await sampleColor(annotatedRect);
+      check("引用之后原文那层也是**绿色**，而且**留住了**",
+        !!annotatedColor && annotatedColor.g > annotatedColor.b + 12 && annotatedColor.g > annotatedColor.r + 12,
+        annotatedColor ? `rgb(${annotatedColor.r},${annotatedColor.g},${annotatedColor.b})` : "取不到标注高亮矩形");
+      await shot("annotated-green");
+    }
+  }
+}
+
+/* ═══════════ 13. 跨内联元素锚定（含 <strong> 的段落）═══════════ */
+/*
+ * 旧实现要求整段原文落在**单个文本节点**内，而 DSH 的转录里只要出现
+ * `<strong>` / `<code>`，一句话就会被拆成好几个文本节点 ⇒ 引用了却永远不亮。
+ * 这条断言在**含粗体**的段落上跨元素选，提交后必须能看到标注高亮 + 编号牌。
+ */
+{
+  await clearComposer();
+  await sleep(300);
+
+  const richTarget = await cdp.evaluate(`
+    // 找一段**同时含有多个文本节点**的正文（粗体 / 行内代码会把文字切开）
+    const nodes = [...document.querySelectorAll('p,li')]
+      .filter((n) => {
+        const r = n.getBoundingClientRect();
+        if (r.left < 280 || r.width < 160 || r.top < 8) return false;
+        const walker = document.createTreeWalker(n, NodeFilter.SHOW_TEXT);
+        let count = 0;
+        let text = '';
+        while (walker.nextNode()) { count += 1; text += walker.currentNode.nodeValue; }
+        return count >= 2 && text.trim().length >= 20;
+      });
+    const node = nodes[0] || null;
+    if (!node) return null;
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    const line = [...range.getClientRects()].filter((r) => r.width > 80 && r.height > 6)[0];
+    if (!line) return null;
+    const y = Math.round(line.top + line.height / 2);
+    return {
+      nodeCount: (() => { const w = document.createTreeWalker(node, NodeFilter.SHOW_TEXT); let c = 0; while (w.nextNode()) c += 1; return c; })(),
+      from: { x: Math.round(line.left + 3), y },
+      to: { x: Math.round(line.right - 3), y }
+    };
+  `);
+
+  if (!richTarget) {
+    check("跨内联锚定：页面上找得到含多个文本节点的段落", false, "没有这样的段落");
+  } else {
+    await cdp.dragSelect(richTarget.from, richTarget.to, { steps: 8, frameDelay: 16 });
+    await sleep(500);
+    const quoteButton = await cdp.evaluate(`
+      const el = document.querySelector('[data-dsa="quote"]');
+      if (!el) return null;
+      const rect = el.getBoundingClientRect();
+      return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+    `);
+    if (quoteButton) {
+      await cdp.clickAt(quoteButton.x, quoteButton.y);
+      await sleep(800);
+      const rich = await cdp.evaluate(`
+        const layer = window.CSS && window.CSS.highlights ? window.CSS.highlights.get('dsh-selection-ask') : null;
+        const editor = document.querySelector('[contenteditable="true"],[contenteditable=""]');
+        return {
+          annotation: layer ? layer.size : 0,
+          badges: document.querySelectorAll('[data-dsa="badge"]').length,
+          chips: editor ? editor.querySelectorAll('[data-composer-chip]').length : -1
+        };
+      `);
+      check(`跨内联元素（该段 ${richTarget.nodeCount} 个文本节点）也能锚上标注高亮`,
+        rich.annotation >= 1, `annotation=${rich.annotation}`);
+      check("跨内联元素提交后有编号牌", rich.badges >= 1, `badges=${rich.badges}`);
+      check("跨内联元素提交后输入框里有胶囊", rich.chips >= 1, `chips=${rich.chips}`);
+    }
+  }
+}
+
+/* ═══════════ 14. 超集引用：选得更长时并进原来那条 ═══════════ */
+/*
+ * 他 2026-10-16 提的 Trae 机制：同一区块里，先引短句、再引**包含它的长句**，
+ * 不该多出一个胶囊，而应把原来那条**原地加长**（编号不变）。
+ *
+ * 判据用三样：胶囊数不变、编号牌文本不变、模型最终收到的是加长后的原文。
+ */
+{
+  await clearComposer();
+  await sleep(300);
+
+  // 先在一个段落里选**前半句**，提交
+  const splitTarget = await cdp.evaluate(`
+    const node = [...document.querySelectorAll('p,li')]
+      .filter((n) => (n.innerText || '').trim().length >= 40)
+      .filter((n) => n.getBoundingClientRect().left > 280)[0] || null;
+    if (!node) return null;
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    const line = [...range.getClientRects()].filter((r) => r.width > 120 && r.height > 6)[0];
+    if (!line) return null;
+    const y = Math.round(line.top + line.height / 2);
+    const mid = Math.round(line.left + line.width * 0.45);
+    return {
+      short: { from: { x: Math.round(line.left + 3), y }, to: { x: mid, y } },
+      long: { from: { x: Math.round(line.left + 3), y }, to: { x: Math.round(line.right - 3), y } }
+    };
+  `);
+
+  if (!splitTarget) {
+    check("超集引用：页面上找得到足够长的段落", false, "没有可选中的段落");
+  } else {
+    // 第一次：短的那截
+    await cdp.dragSelect(splitTarget.short.from, splitTarget.short.to, { steps: 8, frameDelay: 16 });
+    await sleep(450);
+    let button = await cdp.evaluate(`
+      const el = document.querySelector('[data-dsa="quote"]');
+      if (!el) return null;
+      const rect = el.getBoundingClientRect();
+      return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+    `);
+    if (button) { await cdp.clickAt(button.x, button.y); await sleep(700); }
+
+    const afterShort = await cdp.evaluate(`
+      const editor = document.querySelector('[contenteditable="true"],[contenteditable=""]');
+      return {
+        chips: editor ? editor.querySelectorAll('[data-composer-chip]').length : -1,
+        badge: (document.querySelector('[data-dsa="badge"]') || {}).textContent || null
+      };
+    `);
+
+    // 第二次：包含它的更长一截
+    await cdp.dragSelect(splitTarget.long.from, splitTarget.long.to, { steps: 8, frameDelay: 16 });
+    await sleep(450);
+    button = await cdp.evaluate(`
+      const el = document.querySelector('[data-dsa="quote"]');
+      if (!el) return null;
+      const rect = el.getBoundingClientRect();
+      return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+    `);
+    if (button) { await cdp.clickAt(button.x, button.y); await sleep(700); }
+
+    const afterLong = await cdp.evaluate(`
+      const editor = document.querySelector('[contenteditable="true"],[contenteditable=""]');
+      const layers = window.CSS && window.CSS.highlights ? window.CSS.highlights.get('dsh-selection-ask') : null;
+      const ranges = layers ? [...layers] : [];
+      const texts = ranges.map((r) => r.toString()).join('\\n');
+      return {
+        chips: editor ? editor.querySelectorAll('[data-composer-chip]').length : -1,
+        badge: (document.querySelector('[data-dsa="badge"]') || {}).textContent || null,
+        annotatedText: texts
+      };
+    `);
+
+    check("再引更长的一截 → 胶囊数量**不增**（并进原来那条）",
+      afterShort.chips === 1 && afterLong.chips === 1,
+      `短=${afterShort.chips} → 长=${afterLong.chips}`);
+    check("并进之后**编号不变**",
+      !!afterShort.badge && afterShort.badge === afterLong.badge,
+      `${JSON.stringify(afterShort.badge)} → ${JSON.stringify(afterLong.badge)}`);
+    check("原文上的高亮跟着**加长**（不是只留原来那一小截）",
+      afterLong.annotatedText.length > 0,
+      `高亮片段数/长度=${afterLong.annotatedText.length}`);
+
+    /*
+     * 最关键的一条：**胶囊本身确实"更新成更长的引用了"**。
+     *
+     * 怎么证：悬停那枚胶囊 → 浮出的原文预览读的是登记处（`quoteByLabel.get(label).text`），
+     * 而不是宿主在插入时刻缓存下来的那份投影。所以预览变长 == 这枚胶囊现在代表的是长句。
+     * （模型侧同理：发送时走 `codec.serialize(ref)` 现查登记处，见宿主 `sinkSerialized`。）
+     */
+    const hoverPreview = await cdp.evaluate(`
+      const chip = document.querySelector('[data-composer-chip="selection"]');
+      if (!chip) return null;
+      chip.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 120));
+      const tip = document.querySelector('[data-dsa="chiptip"]');
+      const text = tip ? tip.querySelector('.dsa-chiptip__text') : null;
+      return text ? text.textContent : null;
+    `);
+    check("悬停胶囊看到的原文**已经是加长后的那段**（胶囊被更新了）",
+      typeof hoverPreview === "string" && hoverPreview.trim().length > 12,
+      `预览长度=${typeof hoverPreview === "string" ? hoverPreview.trim().length : "取不到"}`);
+  }
+}
+
+/* ═══════════ 15. 插入点坐标：连引三段的顺序 ═══════════ */
+/*
+ * 他 2026-10-16 实测报的：连引三段，输入框里变成 `选中文本 1`、`3`、`2`。
+ *
+ * 根因（宿主源码级）：detect 投影里每个胶囊只占 **1** 个字符，插件却按"占 0"算，
+ * 前两个候选必然越界被拒 ⇒ 落到"胶囊数+1…0"的小整数阶梯；那个起点恰好落在
+ * 最后一枚胶囊的 1 字符段内，宿主 `resolvePoint()` 把它解析成"胶囊前面" ⇒ 错位。
+ *
+ * 这条断言就是钉住它：**顺序必须是 1、2、3**，而且第三段特意挑"跨内联元素/多行"
+ * 的那种（他那句"跨段或者跨不同格式的行时会发生"）。
+ */
+{
+  await clearComposer();
+  await sleep(350);
+
+  /** 连引三段：每次都换一个段落，最后一段优先挑"含多个文本节点"的（跨格式）。 */
+  const pickTargets = await cdp.evaluate(`
+    const visible = (node) => {
+      const r = node.getBoundingClientRect();
+      return r.width > 200 && r.height > 8 && r.top > 8 && r.bottom < window.innerHeight - 120;
+    };
+    const textNodeCount = (node) => {
+      const w = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+      let c = 0;
+      while (w.nextNode()) c += 1;
+      return c;
+    };
+    const all = [...document.querySelectorAll('p,li')]
+      .filter((n) => (n.innerText || '').trim().length >= 20)
+      .filter((n) => n.getBoundingClientRect().left > 280)
+      .filter(visible);
+    if (all.length < 3) return null;
+    // 顺序：普通段、普通段、**跨格式段**（多文本节点）——最后一个刻意挑最容易触发错位的
+    const rich = all.filter((n) => textNodeCount(n) >= 2);
+    const plain = all.filter((n) => textNodeCount(n) === 1);
+    const chosen = [];
+    if (plain.length >= 2) chosen.push(plain[0], plain[1]);
+    if (rich.length >= 1) chosen.push(rich[rich.length - 1]);
+    else chosen.push(all[all.length - 1]);
+    while (chosen.length < 3) chosen.push(all[chosen.length]);
+    return chosen.slice(0, 3).map((node) => {
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      const line = [...range.getClientRects()].filter((r) => r.width > 80 && r.height > 6)[0];
+      if (!line) return null;
+      const y = Math.round(line.top + line.height / 2);
+      return {
+        nodeCount: textNodeCount(node),
+        from: { x: Math.round(line.left + 3), y },
+        to: { x: Math.round(line.right - 3), y }
+      };
+    });
+  `);
+
+  if (!pickTargets || pickTargets.some((t) => t === null)) {
+    check("插入点顺序：页面上找得到三段可引用的正文", false, "段落不够");
+  } else {
+    for (const spot of pickTargets) {
+      await cdp.dragSelect(spot.from, spot.to, { steps: 8, frameDelay: 16 });
+      await sleep(400);
+      const button = await cdp.evaluate(`
+        const el = document.querySelector('[data-dsa="quote"]');
+        if (!el) return null;
+        const rect = el.getBoundingClientRect();
+        return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+      `);
+      if (button) { await cdp.clickAt(button.x, button.y); await sleep(650); }
+    }
+
+    const order = await cdp.evaluate(`
+      const editor = document.querySelector('[contenteditable="true"],[contenteditable=""]');
+      if (!editor) return null;
+      const chips = [...editor.querySelectorAll('[data-composer-chip="selection"]')];
+      return chips.map((chip) => {
+        const titled = chip.querySelector('[title]');
+        return (titled || chip).getAttribute('title') || '';
+      });
+    `);
+    const labels = Array.isArray(order) ? order : [];
+    // 只抽数字比，免得被本地化文案（"选中文本"/"Selection"）绊住
+    const numbers = labels.map((label) => String(label).match(/\d+/)).map((m) => (m ? Number(m[0]) : null));
+    check("连引三段 → 输入框里正好三枚胶囊", labels.length === 3, `chips=${labels.length}`);
+    check("连引三段 → 胶囊顺序是 1,2,3（不是 1,3,2）",
+      numbers.length === 3 && numbers[0] === 1 && numbers[1] === 2 && numbers[2] === 3,
+      `实际=${JSON.stringify(numbers)} 标签=${JSON.stringify(labels)}`);
+    await shot("three-quotes");
+  }
+}
+
+/* ═══════════ 16. 插入点跟随输入框光标 ═══════════ */
+/*
+ * 他明确要求"添加的位置起码要在输入框的光标处"。
+ *
+ * 做法：在输入框里先打一段文字，然后把 DOM 光标放到**第一个字符之后**，
+ * 再引用一段 —— 胶囊必须落在**光标处**（即第一个字符与其余文字之间），
+ * 而不是被追加到末尾。
+ */
+{
+  await clearComposer();
+  await sleep(300);
+
+  // 先给输入框里打一段可辨认的文字（必须**真实点击**拿到焦点，Input.insertText 只往已聚焦元素里插）
+  const composerSpot = await cdp.evaluate(`
+    const editor = document.querySelector('[contenteditable="true"],[contenteditable=""]');
+    if (!editor) return null;
+    const rect = editor.getBoundingClientRect();
+    return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+  `);
+  if (!composerSpot) {
+    check("插入点验收：拿得到输入框", false, "没找到 contenteditable");
+  } else {
+    await cdp.clickAt(composerSpot.x, composerSpot.y);
+    await sleep(150);
+  }
+  await cdp.evaluate(`
+    const editor = document.querySelector('[contenteditable="true"],[contenteditable=""]');
+    if (!editor) return false;
+    const r = document.createRange();
+    r.selectNodeContents(editor);
+    r.collapse(false);
+    const s = window.getSelection();
+    s.removeAllRanges();
+    s.addRange(r);
+    return true;
+  `);
+  await sleep(150);
+  // 三个字：光标停在 1 号位时，前面应当只有 1 个字；被追加到末尾则是 3 个字
+  const MARK = "光标记";
+  await cdp.send("Input.insertText", { text: MARK });
+  await sleep(250);
+
+  const typed = await cdp.evaluate(`
+    const editor = document.querySelector('[contenteditable="true"],[contenteditable=""]');
+    return editor ? editor.innerText.replace(/\\n/g, "") : null;
+  `);
+  check("插入点验收：输入框里先有一段文字", String(typed).includes(MARK), JSON.stringify(typed));
+
+  // 把光标挪到第 1 个字符之后
+  await cdp.evaluate(`
+    const editor = document.querySelector('[contenteditable="true"],[contenteditable=""]');
+    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+    const node = walker.nextNode();
+    if (!node) return false;
+    const r = document.createRange();
+    r.setStart(node, 1);
+    r.collapse(true);
+    const s = window.getSelection();
+    s.removeAllRanges();
+    s.addRange(r);
+    return true;
+  `);
+  await sleep(120);
+
+  // 选一段正文引用
+  const caretTarget = await cdp.evaluate(`
+    const node = [...document.querySelectorAll('p,li')]
+      .filter((n) => (n.innerText || '').trim().length >= 20)
+      .filter((n) => n.getBoundingClientRect().left > 280)[0] || null;
+    if (!node) return null;
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    const line = [...range.getClientRects()].filter((r) => r.width > 80 && r.height > 6)[0];
+    if (!line) return null;
+    const y = Math.round(line.top + line.height / 2);
+    return { from: { x: Math.round(line.left + 3), y }, to: { x: Math.round(line.right - 3), y } };
+  `);
+  if (!caretTarget) {
+    check("插入点验收：页面上找得到可引用的正文", false, "没有可选中段落");
+  } else {
+    await cdp.dragSelect(caretTarget.from, caretTarget.to, { steps: 8, frameDelay: 16 });
+    await sleep(450);
+    const button = await cdp.evaluate(`
+      const el = document.querySelector('[data-dsa="quote"]');
+      if (!el) return null;
+      const rect = el.getBoundingClientRect();
+      return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+    `);
+    if (button) { await cdp.clickAt(button.x, button.y); await sleep(700); }
+
+    /*
+     * 判据：胶囊出现在**光标处**（1 号位）。
+     *
+     * 读编辑器顶层孩子，数胶囊**前面**有多少个可见字符：
+     *   · 插在光标处 ⇒ "光" 1 个字（< 3）；
+     *   · 被追加到末尾 ⇒ "光标记" 3 个字（== 3）。
+     * 只比"前面的字数"，不碰胶囊自己的 label 文字（那属于胶囊的内部实现）。
+     */
+    const placement = await cdp.evaluate(`
+      const editor = document.querySelector('[contenteditable="true"],[contenteditable=""]');
+      if (!editor) return null;
+      const kids = [...editor.childNodes];
+      let chipIndex = -1;
+      let before = "";
+      for (let i = 0; i < kids.length; i += 1) {
+        const kid = kids[i];
+        if (kid.nodeType === 1 && kid.matches && kid.matches('[data-composer-chip="selection"]')) { chipIndex = i; break; }
+        if (kid.nodeType === 3 || kid.nodeType === 1) before += kid.textContent || "";
+      }
+      return { chipIndex, beforeLength: before.replace(/\\n/g, "").trim().length };
+    `);
+    check("引用插在**光标处**，不是一律追加到末尾",
+      !!placement && placement.chipIndex >= 0 && placement.beforeLength < String(MARK).length,
+      placement ? `胶囊下标=${placement.chipIndex}、它前面 ${placement.beforeLength} 个字（追加到末尾会是 ${String(MARK).length}）` : "读不到输入框结构");
   }
 }
 

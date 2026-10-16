@@ -38,6 +38,14 @@
   var CSS = __SELECTION_ASK_CSS__;
   /** 我们自己画的所有 DOM 都带这个属性 —— 用"选中我们自己的字"来排除自引用。 */
   var OWN_ATTR = "data-selection-ask";
+  /**
+   * 挂在 `<html>` 上："让原生选区也涂成我们的绿"。
+   *
+   * 为什么必须有：CSSWG 裁定自定义高亮**永远画在原生高亮之下**
+   * （csswg-drafts#4595 / css-pseudo-4 §3.6）—— 只要原生选区还在，
+   * 我们的 `::highlight()` 就露不出来。详见 `updateSelgreen`。
+   */
+  var SELGREEN_ATTR = "data-dsa-selgreen";
   /** 浮层与选区之间的间隙（px）。 */
   var GAP = 8;
   /** 浮层与视口边缘的最小距离（px）。 */
@@ -52,6 +60,10 @@
     zh: {
       quote: "引用到对话",
       quoted: "已引用",
+      /** 短句已引用、这次选了包含它的长句：并进原来那条（编号不变）。 */
+      updated: "已更新为更长的引用",
+      /** 这次选的整段已经在引用里了，不重复添加。 */
+      covered: "这段已经在引用里了",
       truncated: "内容过长，已截断",
       unavailable: "拿不到输入框（插件未生效）",
       aria: "把选中的文本引用到输入框",
@@ -81,6 +93,10 @@
     en: {
       quote: "Add to conversation",
       quoted: "Added",
+      /** A shorter quote is already there and this longer passage contains it — grow that one. */
+      updated: "Updated to the longer quote",
+      /** This passage is already covered by an existing quote. */
+      covered: "Already covered by a quote",
       truncated: "Selection truncated",
       unavailable: "Composer unavailable",
       aria: "Quote the selected text into the composer",
@@ -183,6 +199,183 @@
     return all.filter(function (record) {
       return live[String(labelOf(record))] === true;
     });
+  }
+
+  /**
+   * 从存活记录里挑出"这段新选区该并进哪一条已有引用"。
+   *
+   * 纯函数：DOM 那一半（是否同一区块）由调用方注入的 `containsFn` 负责，便于单测。
+   *
+   * 三种命中（对应 Trae 那条机制，他 2026-10-16 提的）：
+   *  · `same`     —— 文字完全相同：同一处标注不该有两个号，也不该有两个胶囊；
+   *  · `superset` —— 已有的是新选区的**真子串**（这次选得更长、且包含它）：
+   *                 取**最长**的那条原地加长，编号与胶囊都不动；
+   *  · `covered`  —— 反过来，新选区落在某条已有引用内部：已经被覆盖，不再新增。
+   *
+   * @param {Array<{n:number,text:string,ref:string}>} records 存活记录
+   * @param {string} text 这一轮选中的原文
+   * @param {(outer:string, inner:string) => boolean} [containsFn] 同一区块判据
+   * @returns {{kind:'same'|'superset'|'covered', record:object}|null}
+   */
+  function pickSupersede(records, text, containsFn) {
+    var list = Array.isArray(records) ? records : [];
+    var value = String(text == null ? "" : text);
+    // 空选区不参与任何匹配（否则空串是任何字符串的子串，会把"没选东西"判成 covered）
+    if (value === "") return null;
+    var longest = null;
+    for (var index = 0; index < list.length; index += 1) {
+      var other = String(list[index].text == null ? "" : list[index].text);
+      if (other === value) return { kind: "same", record: list[index] };
+      if (other === "" || value.length <= other.length) continue;
+      if (value.indexOf(other) < 0) continue;
+      // 取最长的那条：它最贴近这次加长的结果
+      if (!longest || other.length > String(longest.text).length) longest = list[index];
+    }
+    if (longest) {
+      // 只有落在同一区块才算"同一处标注"；跨段的偶合包含不算
+      var sameBlock = typeof containsFn === "function"
+        ? containsFn(value, String(longest.text))
+        : true;
+      if (sameBlock) return { kind: "superset", record: longest };
+    }
+    for (var back = 0; back < list.length; back += 1) {
+      var outer = String(list[back].text == null ? "" : list[back].text);
+      if (outer.length > value.length && outer.indexOf(value) >= 0) {
+        return { kind: "covered", record: list[back] };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 剪贴板投影长度 + 胶囊 footprint → **detect 投影总长**。
+   *
+   * ⚠️ 这是宿主自己的坐标模型，不是我们的近似。出处：
+   *   `@deepseek-ai/dsh-client-ui-conversation/lib/client.js` 的 `$composerLayout()`：
+   *     `pushLeaf("chip", kid, "￼", kid.getTextContent())`
+   *   —— **每个胶囊在 detect 投影里恰好占 1 个字符**（U+FFFC，对象替换符），
+   *      而在剪贴板投影里占它整段 `clipboardText`。
+   *   文本 / 换行 / 段落间隙三类片段在两个投影里都是 1:1。
+   *
+   * 于是（`InputState.draft` 是剪贴板投影，`occurrences` 各带剪贴板坐标下的 length）：
+   *
+   *     detectLength = draft.length − Σ(occ.length − 1)
+   *                  = draft.length − Σ(occ.length) + occurrences.length
+   *
+   * 为什么必须这么算（2026-10-16 他实测报的「连引三段变成 1,3,2」）：
+   * 旧代码拿 `draft.length − Σ引文长度` 当检测坐标，等于把胶囊按 **0** 个字符算，
+   * 少了 `+胶囊数`；再用"胶囊数+1…0"的小整数阶梯兜底时，那个起点恰好**落在最后
+   * 一枚胶囊的 1 字符 detect 段内**，而宿主 `resolvePoint()` 对原子段返回的是
+   * "胶囊旁边"的元素点 ⇒ 新胶囊被插到**它前面** ⇒ 顺序错乱。
+   *
+   * @param {string} draft 剪贴板投影（`InputState.draft`）
+   * @param {Array<{length:number}>} occurrences `InputState.occurrences`
+   * @returns {number} detect 坐标下的文档末尾（也是"追加"的合法位置）
+   */
+  function detectLengthOf(draft, occurrences) {
+    var text = String(draft == null ? "" : draft);
+    var list = Array.isArray(occurrences) ? occurrences : null;
+    // 读不到 occurrences 时**不假装知道**：直接按无胶囊处理，由调用方回退到旧启发式。
+    if (list === null || list.length === 0) return text.length;
+    var footprint = 0;
+    for (var index = 0; index < list.length; index += 1) {
+      var size = Number(list[index] && list[index].length);
+      footprint += isFinite(size) && size > 0 ? size : 0;
+    }
+    // 下界钳制：`occurrences` 与 `draft` 若因为竞态对不上，可能算出负数 ——
+    // 坐标可以"退化到 0"，但绝不能是个负数丢给宿主。
+    return Math.max(0, text.length - footprint + list.length);
+  }
+
+  /**
+   * 走一遍编辑器 DOM，算出**光标**与**整篇**在宿主 detect 坐标下的位置。
+   *
+   * 规则照抄宿主 `$composerLayout()`：胶囊 1 个字符、`<br>` 1 个字符、文本按长度、
+   * **根级块与块之间宿主会补 1 个换行**（那一层 `gap` 段）。
+   * 胶囊元素**整棵子树跳过**——它渲染出来的 label 文字在 detect 投影里并不存在，
+   * 顺手扫文本节点会把 `选中文本 1` 这 6 个字算进去。
+   *
+   * ⚠️ `total` 是**自检值**：只有它与 `detectLengthOf()` 相等时，`caret` 才可信。
+   * 两者不等说明 DOM 结构与宿主模型不符（宿主换了渲染方式），此时必须放弃光标候选、
+   * 退回"文档末尾"——算错却被接受，比算不出来更糟。
+   *
+   * @param {HTMLElement|null} editor 输入框的可编辑元素
+   * @returns {{caret: number|null, total: number}} 光标 detect 坐标（不在编辑器内为 null）与整篇长度
+   */
+  function domDetectOffsets(editor) {
+    var result = { caret: null, total: 0 };
+    if (!editor || !editor.childNodes) return result;
+
+    var caretNode = null;
+    var caretOffset = 0;
+    try {
+      var selection = window.getSelection();
+      if (selection && selection.rangeCount > 0) {
+        var range = selection.getRangeAt(0);
+        if (range.collapsed && editor.contains(range.startContainer)) {
+          caretNode = range.startContainer;
+          caretOffset = range.startOffset;
+        }
+      }
+    } catch (error) {
+      /* 没有选区：只算整篇长度 */
+    }
+
+    var at = 0;
+    var done = false;
+
+    function walk(node) {
+      if (done || !node) return;
+      if (node.nodeType === 3) {
+        if (node === caretNode) {
+          result.caret = at + Math.min(caretOffset, node.nodeValue.length);
+          done = true;
+          return;
+        }
+        at += node.nodeValue.length;
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      // 胶囊：整棵子树只算 1 个字符（U+FFFC）
+      if (node.hasAttribute && node.hasAttribute("data-composer-chip")) {
+        if (node === caretNode) { result.caret = at; done = true; return; }
+        at += 1;
+        return;
+      }
+      if (node.tagName === "BR") { at += 1; return; }
+
+      var kids = node.childNodes;
+      if (!kids) return;
+      var isCaretHost = node === caretNode;
+      var limit = isCaretHost ? Math.min(caretOffset, kids.length) : kids.length;
+      for (var index = 0; index < limit; index += 1) walk(kids[index]);
+      if (isCaretHost && !done) { result.caret = at; done = true; }
+    }
+
+    function walkRoot(parent) {
+      var kids = parent.childNodes;
+      var isCaretHost = parent === caretNode;
+      var limit = isCaretHost ? Math.min(caretOffset, kids.length) : kids.length;
+      var blocks = 0;
+      for (var index = 0; index < limit; index += 1) {
+        var kid = kids[index];
+        // 根级块之间：宿主会补一个换行（gap 段），detect 与剪贴板各 +1
+        if (kid && kid.nodeType === 1) {
+          if (blocks > 0) at += 1;
+          blocks += 1;
+        }
+        walk(kid);
+      }
+      if (isCaretHost && !done) { result.caret = at; done = true; }
+    }
+
+    try {
+      walkRoot(editor);
+    } catch (error) {
+      return { caret: null, total: 0 };
+    }
+    result.total = at;
+    return result;
   }
 
   /**
@@ -452,18 +645,104 @@
       var quoteByText = new Map();
       /** 胶囊在 DOM 上只有 label（title="选中文本 1"），没有 ref —— 靠它反查。 */
       var quoteByLabel = new Map();
-      /**
-       * 已经插进输入框的胶囊，在**剪贴板投影**里一共占了多少字符。
-       *
-       * 用来算下一个胶囊的插入点：`draft` 是剪贴板投影（胶囊在里面占位），
-       * 而编辑坐标里它几乎不占位 —— 两者差的就是这个数（2026-10-11 实测）。
-       */
-      var chipClipTotal = 0;
 
-      /** 给一段原文分配（或取回）它的编号记录。 */
-      function registerQuote(text) {
-        var existing = quoteByText.get(text);
-        if (existing) return existing;
+      /* 注：曾经有一个 `chipClipTotal`（"胶囊在剪贴板投影里占了多少字符"）用来自行推算
+         插入点。2026-10-16 已删除 —— 它与宿主节点里缓存的那份长度**必然漂移**
+         （尤其把记录"加长"之后），而 `InputState.occurrences` 是宿主公布的真值，
+         坐标一律从那里算（见 `detectLengthOf`）。少一套事实源，就少一条算错的路。 */
+
+      /**
+       * 上一帧登录处里还“活着”的胶囊 label。
+       *
+       * 用途：检测“整批删除”——当这一帧读到的 liveChipLabels 从非空变成空（或只剩别的插件的胶囊），
+       * 说明用户把本插件的引用全删了，下一轮新引用应该重新从 1 开始编号。
+       * 不在这里做“部分删除后回填最小编号”：那种情况原文高亮与编号早已对不上，
+       * 回填会造成“新引用抢旧编号”的错觉；保持单调递增更诚实。
+       */
+      var lastLiveLabels = null;
+
+      /**
+       * 新选区与已有引用是不是"同一区块里的同一处"。
+       *
+       * 拿两条真实 Range 做包含判定；任一条锚不到时**放行**（宁可并，也不漏）。
+       */
+      function sameBlockContains(outer, inner) {
+        var outRanges = findQuoteRanges(outer);
+        var inRanges = findQuoteRanges(inner);
+        if (outRanges.length === 0 || inRanges.length === 0) return true;
+        try {
+          var outside = outRanges[0];
+          var inside = inRanges[0];
+          var startCmp = inside.compareBoundaryPoints(Range.START_TO_START, outside);
+          var endCmp = inside.compareBoundaryPoints(Range.END_TO_END, outside);
+          return startCmp >= 0 && endCmp <= 0;
+        } catch (error) {
+          return true;
+        }
+      }
+
+      /**
+       * 给一段原文分配（或取回/加长）它的编号记录。
+       *
+       * @param {string} text 选中的原文
+       * @param {{allowSupersede?: boolean}} [options] 带批注时传 `{allowSupersede:false}`：
+       *   那时要另起一个胶囊（批注得跟着自己的胶囊走），所以不做并/覆盖判定。
+       * @returns {{record:object, action:'new'|'same'|'superset'|'covered'}}
+       */
+      function registerQuote(text, options) {
+        var allowSupersede = !(options && options.allowSupersede === false);
+        var labelsNow = liveChipLabels();
+        if (labelsNow !== null) {
+          var live = Object.create(null);
+          for (var li = 0; li < labelsNow.length; li += 1) live[labelsNow[li]] = true;
+
+          if (labelsNow.length === 0) {
+            // 用户把本插件的引用全删了：整批重置
+            quoteByRef.clear();
+            quoteByText.clear();
+            quoteByLabel.clear();
+            quoteSeq = 0;
+          } else {
+            // 部分删除：只剔除已经不在输入框里的登记记录
+            var toRemove = [];
+            quoteByRef.forEach(function (rec, ref) {
+              if (!live[chipLabel(rec)]) toRemove.push(ref);
+            });
+            for (var ri = 0; ri < toRemove.length; ri += 1) {
+              var rec = quoteByRef.get(toRemove[ri]);
+              quoteByRef.delete(toRemove[ri]);
+              if (rec) {
+                quoteByText.delete(rec.text);
+                quoteByLabel.delete(chipLabel(rec));
+              }
+            }
+          }
+        }
+        lastLiveLabels = labelsNow;
+
+        /*
+         * ⚠️ 只有**确实读到了输入框里的存活胶囊**，才允许"并进已有那条"。
+         *
+         * 读不到时（`labelsNow === null`：拿不到输入框）登记处里可能还留着早已被删掉的
+         * 记录。那种情况下若判成 superset/covered 就会**不插胶囊** ——
+         * 等于用户点了「引用」却什么都没发生。宁可多插一个新胶囊（fail-open），
+         * 也不能把这次引用静默吞掉。
+         */
+        if (allowSupersede && labelsNow !== null) {
+          var pick = pickSupersede(allQuoteRecords(), text, sameBlockContains);
+          if (pick && pick.kind === "same") return { record: pick.record, action: "same" };
+          if (pick && pick.kind === "covered") return { record: pick.record, action: "covered" };
+          if (pick && pick.kind === "superset") {
+            // 原地加长：编号、ref、label 全部不动 —— 输入框里那枚胶囊继续代表它
+            var target = pick.record;
+            quoteByText.delete(target.text);
+            target.text = text;
+            quoteByText.set(text, target);
+            scheduleHighlightSync();
+            return { record: target, action: "superset" };
+          }
+        }
+
         quoteSeq += 1;
         var record = { n: quoteSeq, text: text, ref: "q" + quoteSeq };
         quoteByRef.set(record.ref, record);
@@ -471,7 +750,7 @@
         quoteByLabel.set(chipLabel(record), record);
         // 新引用一进来就重算标注（节流到每帧一次）
         scheduleHighlightSync();
-        return record;
+        return { record: record, action: "new" };
       }
 
       /** 胶囊上的字。 */
@@ -559,54 +838,81 @@
       }
 
       /**
+       * 算这一枚胶囊该插在哪个 **detect 坐标**。
+       *
+       * 优先**输入框光标处**（他 2026-10-16 明确要求"起码要在光标处"）；
+       * 光标不可信时退到**文档末尾**（也就是"追加"）。
+       *
+       * ⚠️ "可信"的判据是**自检**：DOM 走出来的整篇长度必须与宿主模型算出的 detect
+       * 总长相等（见 `domDetectOffsets` / `detectLengthOf`）。不等就说明 DOM 结构不是
+       * 我们以为的那样，此时宁可丢弃光标、退回末尾 —— 坐标算错却被宿主接受，
+       * 比算不出来更糟（那正是这次 1,3,2 事故的形态）。
+       *
+       * @returns {{at:number, end:number}} `at` = 要插的位置；`end` = 文档末尾（兜底候选）
+       */
+      function chipInsertPosition(editor, draft, occurrences) {
+        var end = detectLengthOf(draft, occurrences);
+        try {
+          var walked = domDetectOffsets(editor);
+          if (walked.total === end && typeof walked.caret === "number") {
+            return { at: walked.caret, end: end };
+          }
+        } catch (error) {
+          /* 走不动就退回末尾 */
+        }
+        return { at: end, end: end };
+      }
+
+      /**
        * 往输入框插一个引用胶囊。
        *
+       * @param {object} record 登记记录
+       * @param {string} sessionId 会话 id
+       * @param {string} draft 剪贴板投影（`InputState.draft`）
+       * @param {number} draftRev 编辑修订号（CAS）
+       * @param {Array|null} occurrences `InputState.occurrences`（精确 detect 坐标的来源）
+       * @param {number} [atDetect] 期望插入的 **detect** 坐标；缺省 = 文档末尾
        * @returns {string|null} **失败原因**（成功时 null）。故意返回原因而不是 false：
        *   兜底退回纯文本是"看得见的行为降级"，必须能在控制台说清为什么 ——
        *   否则这类问题只会表现成"胶囊有时候不出来"，无从查起。
        */
-      function insertQuoteChip(record, sessionId, draft, draftRev, at) {
+      function insertQuoteChip(record, sessionId, draft, draftRev, occurrences, atDetect) {
         if (!ensureReferenceSource()) return "no-reference-source";
         var candidates = sessionScopes(sessionId);
         if (candidates.length === 0) return "no-session-scope";
-        // ⚠️ 插入点不止一个候选，**逐个试**（2026-10-11 实测）。
-        //
-        // 原因：`draft` 是**剪贴板投影**，里面已有的胶囊各占了它 `clipboardText`
-        // 那么多字符；而 `insertText` / `insertReference` 的 span 要的是**编辑坐标**，
-        // 胶囊在那里几乎不占位。所以草稿里一旦有胶囊，`draft.length` 就落到坐标
-        // 空间之外 —— 表现是"第一次引用能出胶囊，第二次插不进去"。
-        //
-        // 与其猜哪套坐标，不如把候选都发一遍，**让 `bail` 的返回值挑出对的那个**。
-        var base = typeof at === "number" ? at : draft.length;
-        var spots = [];
-        var trimmed = base - chipClipTotal;
-        if (chipClipTotal > 0 && trimmed >= 0 && trimmed !== base) spots.push(trimmed);
-        spots.push(base);
-        /**
-         * 兜底阶梯：**有胶囊时，追加位置一定落在 0 … 胶囊数+1 这个小范围里**。
+        /*
+         * 插入点：现在**不再靠猜**。
          *
-         * 为什么必须有这一层（2026-10-11 实测）：`chipClipTotal` 累加的是
-         * `quoteMarkdown(text).length`（整段剪贴板文本），而 `InputState.draft`
-         * 是宿主自己的投影，两者**对不上**。一旦对不上，`base - chipClipTotal`
-         * 会变成负数被丢掉，于是候选里只剩 `base` —— 而 `base` 在"已经有胶囊"
-         * 时**一定被拒**（实测 `not-accepted(binding.ctx@19=undefined)`）。
-         * 结果：第二次引用静默失败，兜底又因为"草稿里已有胶囊"拒绝写入，
-         * 用户看到的是**点了没反应**。
+         * 宿主有两个投影（`$composerLayout()`）：**detect** 里每个胶囊只占 1 个字符
+         * （U+FFFC），**剪贴板**里占它整段引文；而 `insertReference` / `insertText`
+         * 的 `span` 要的是 **detect 坐标**。`InputState.occurrences` 把每枚胶囊在
+         * 剪贴板坐标下的 offset/length 公布出来，于是 detect 末尾可以精确算出
+         * （见 `detectLengthOf`）。
          *
-         * 实测的接受情况（无输入文字）：0 个胶囊 → 只有 0 被接受；
-         * 1 个胶囊 → 2；2 个胶囊 → 3。降序试 ⇒ 取到的是**最靠后的合法位置**，
-         * 也就是用户要的"追加"。
-         *
-         * ⚠️ 只在**已经有胶囊**时才加这一层：没有胶囊时 `base` 就是真实的文本
-         * 位置，拿小整数去试会把引用插到用户已经写好的问题**前面**去。
+         * 旧代码拿 `draft.length`（剪贴板长度）与 `draft.length − Σ引文长度` 去猜：
+         * 有胶囊时**必然**落在 detect 空间之外 ⇒ 被宿主拒绝 ⇒ 落到"胶囊数+1…0"的
+         * 小整数阶梯；而那个起点恰好落在最后一枚胶囊的 1 字符 detect 段内 ⇒ 宿主
+         * `resolvePoint()` 把它解析成"胶囊前面" ⇒ **连引三段变成 1,3,2**（他实测报的）。
          */
-        var chipLabels = liveChipLabels();
-        if (chipLabels && chipLabels.length >= 1) {
-          for (var back = chipLabels.length + 1; back >= 0; back -= 1) {
-            if (spots.indexOf(back) < 0) spots.push(back);
+        var spots = [];
+        function addSpot(value) {
+          if (typeof value !== "number" || !isFinite(value)) return;
+          var spot = Math.max(0, Math.round(value));
+          if (spots.indexOf(spot) < 0) spots.push(spot);
+        }
+        var exactEnd = detectLengthOf(draft, occurrences);
+        // 候选 1：光标处（缺省就是文档末尾）；候选 2：文档末尾兜底
+        addSpot(typeof atDetect === "number" ? atDetect : exactEnd);
+        addSpot(exactEnd);
+        if (!Array.isArray(occurrences)) {
+          // 读不到 occurrences（插槽没给出 useInput 之类）：只能退回旧启发式。
+          // 坐标可能不准，但功能不消失；真出问题会在控制台留下 not-accepted 原因。
+          addSpot(draft.length);
+          var fallbackLabels = liveChipLabels();
+          if (fallbackLabels && fallbackLabels.length >= 1) {
+            for (var back = fallbackLabels.length + 1; back >= 0; back -= 1) addSpot(back);
           }
         }
-        var tried = [];
         var tried = [];
         for (var index = 0; index < candidates.length; index += 1) {
           var candidate = candidates[index];
@@ -635,13 +941,7 @@
                 // 折叠 span：插在候选位置
                 span: { start: spots[spot], end: spots[spot], draftRev: draftRev }
               });
-              if (accepted === true) {
-                // 记下这个胶囊在剪贴板投影里占的长度，给下一个胶囊算插入点用
-                // （⚠️ 它只是**首选**候选：宿主投影与这里的算法并不总是对得上，
-                //    所以下面还有一层"小整数阶梯"兜底，见 spots 的构造）
-                chipClipTotal += quoteMarkdown(record.text).length;
-                return null;
-              }
+              if (accepted === true) return null;
               tried.push(candidate.via + "@" + spots[spot] + "=" + String(accepted));
             } catch (error) {
               tried.push(candidate.via + "@" + spots[spot] + " threw " + String(error && error.message ? error.message : error));
@@ -767,39 +1067,170 @@
         return badgeLayer;
       }
 
+      /** 块级容器标签：跨块就不在同一个拼接缓冲里锚（跨块由"逐行"那一层负责）。 */
+      var BLOCK_TAGS = {
+        P: 1, LI: 1, PRE: 1, TD: 1, TH: 1, BLOCKQUOTE: 1, DD: 1, DT: 1,
+        DIV: 1, SECTION: 1, ARTICLE: 1, FIGURE: 1, FIGCAPTION: 1,
+        H1: 1, H2: 1, H3: 1, H4: 1, H5: 1, H6: 1
+      };
+
+      /** 往上找最近的块级祖先（找不到就退回 body）。 */
+      function blockOf(el) {
+        var node = el;
+        while (node && node !== document.body) {
+          if (node.tagName && BLOCK_TAGS[node.tagName] === 1) return node;
+          node = node.parentElement;
+        }
+        return document.body;
+      }
+
       /**
-       * 在页面里按**文字**找回一段原文的 Range。
+       * 这个文本节点能不能进锚定搜索。
        *
        * 排除两类地方：我们自己画的浮层（不然会锚到编号牌自己），
        * 以及输入框（那里的是胶囊的 label，不是原文）。
-       *
-       * @returns {Range|null}
        */
-      function findQuoteRange(needle) {
-        if (!needle) return null;
-        var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
-          acceptNode: function (node) {
-            var value = node.nodeValue;
-            if (!value || value.indexOf(needle) < 0) return NodeFilter.FILTER_REJECT;
-            var parent = node.parentElement;
-            if (!parent) return NodeFilter.FILTER_REJECT;
-            if (parent.closest("[" + OWN_ATTR + "]")) return NodeFilter.FILTER_REJECT;
-            if (parent.closest('[contenteditable="true"],[contenteditable=""]')) return NodeFilter.FILTER_REJECT;
-            return NodeFilter.FILTER_ACCEPT;
-          }
-        });
-        var node = walker.nextNode();
-        if (!node) return null;
-        var at = node.nodeValue.indexOf(needle);
-        if (at < 0) return null;
+      function anchorableText(node) {
+        if (!node || !node.nodeValue) return false;
+        var parent = node.parentElement;
+        if (!parent) return false;
+        if (parent.closest("[" + OWN_ATTR + "]")) return false;
+        if (parent.closest('[contenteditable="true"],[contenteditable=""]')) return false;
+        return true;
+      }
+
+      /** 一行原文的 2-gram 集合 —— 用来快速排除"根本不可能参与这次拼接"的文本节点。 */
+      function bigramsOf(line) {
+        var set = Object.create(null);
+        for (var index = 0; index + 1 < line.length; index += 1) {
+          set[line.slice(index, index + 2)] = 1;
+        }
+        return set;
+      }
+
+      /**
+       * 这个节点的文字有没有可能参与拼出这一行。
+       *
+       * 先做一次粗筛（否则流式输出时每帧都要把整页文本重新拼一遍）：
+     * 短碎片一律收（它可能是被元素切开的一小块），长节点看有没有共同的 2-gram。
+       */
+      function nodeMayContribute(value, line, grams) {
+        if (value.length <= 3) return true;
+        if (!grams) return value.indexOf(line) >= 0;
+        for (var index = 0; index + 1 < value.length; index += 1) {
+          if (grams[value.slice(index, index + 2)] === 1) return true;
+        }
+        return false;
+      }
+
+      /** 把"拼接串里的偏移"映射回 DOM 节点，造一个 Range。 */
+      function rangeFromBuffer(nodes, starts, at, length) {
+        var end = at + length - 1;
+        var startIndex = -1;
+        var endIndex = -1;
+        for (var index = 0; index < nodes.length; index += 1) {
+          var from = starts[index];
+          var to = from + nodes[index].nodeValue.length - 1;
+          if (startIndex < 0 && at >= from && at <= to) startIndex = index;
+          if (endIndex < 0 && end >= from && end <= to) endIndex = index;
+          if (startIndex >= 0 && endIndex >= 0) break;
+        }
+        if (startIndex < 0 || endIndex < 0) return null;
         try {
           var range = document.createRange();
-          range.setStart(node, at);
-          range.setEnd(node, at + needle.length);
+          range.setStart(nodes[startIndex], at - starts[startIndex]);
+          range.setEnd(nodes[endIndex], end - starts[endIndex] + 1);
           return range;
         } catch (error) {
           return null;
         }
+      }
+
+      /**
+       * 在**同一个块**里把相邻文本节点的文字拼起来找一行原文 —— 跨内联元素也能锚上。
+       *
+       * 为什么必须这样（2026-10-16 他实测报的）：旧实现要求整段原文落在**单个文本节点**
+       * 内（`node.nodeValue.indexOf(needle) >= 0`），而 DSH 的转录里只要出现
+       * `<strong>` / `<code>`，一句话就会被拆成好几个文本节点 ⇒ 引用了却**永远不亮**，
+       * 连编号牌都没有。这里改成"同块内拼接后再找"，与 DOM 怎么切无关。
+       *
+       * @param {string} line 单行原文
+       * @returns {Range|null}
+       */
+      function findLineRange(line) {
+        if (!line) return null;
+        var grams = line.length >= 2 ? bigramsOf(line) : null;
+        var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+          acceptNode: function (node) {
+            if (!anchorableText(node)) return NodeFilter.FILTER_REJECT;
+            return nodeMayContribute(node.nodeValue, line, grams)
+              ? NodeFilter.FILTER_ACCEPT
+              : NodeFilter.FILTER_REJECT;
+          }
+        });
+        var nodes = [];
+        var starts = [];
+        var buffer = "";
+        var block = null;
+        // 滑动窗口：只留尾部两倍行长，别把整页拼成一个巨型字符串
+        var keep = line.length * 2 + 64;
+        var node = walker.nextNode();
+        while (node) {
+          var owner = blockOf(node.parentElement);
+          if (block !== null && owner !== block) {
+            // 换块：本块里没命中就不跨块拼（跨块由逐行那层负责）
+            nodes = [];
+            starts = [];
+            buffer = "";
+          }
+          block = owner;
+          starts.push(buffer.length);
+          nodes.push(node);
+          buffer += node.nodeValue;
+
+          var at = buffer.indexOf(line);
+          if (at >= 0) {
+            var hit = rangeFromBuffer(nodes, starts, at, line.length);
+            if (hit) return hit;
+          }
+
+          if (buffer.length > keep) {
+            var dropBefore = buffer.length - keep;
+            var cut = 0;
+            while (cut + 1 < nodes.length && starts[cut + 1] <= dropBefore) cut += 1;
+            if (cut > 0) {
+              var base = starts[cut];
+              nodes = nodes.slice(cut);
+              starts = starts.slice(cut).map(function (value) { return value - base; });
+              buffer = buffer.slice(base);
+            }
+          }
+          node = walker.nextNode();
+        }
+        return null;
+      }
+
+      /**
+       * 按**文字**找回一段原文 —— 可以跨内联元素，也可以跨段落（逐行各锚一段）。
+       *
+       * 选区 `toString()` 里的换行是"块边界"的记号，所以这里逐行各自锚一次：
+       * 行内跨 `<strong>` / `<code>` 能锚上，整段跨段落则锚成多段。
+       *
+       * @param {string} needle 原文
+       * @returns {Range[]} 命中的各段（找不到就是空数组，调用方什么都不做）
+       */
+      function findQuoteRanges(needle) {
+        var text = String(needle == null ? "" : needle);
+        if (text === "") return [];
+        var lines = text.split(/\r\n?|\n/)
+          .map(function (line) { return line.trim(); })
+          .filter(function (line) { return line !== ""; });
+        var out = [];
+        for (var index = 0; index < lines.length; index += 1) {
+          var range = findLineRange(lines[index]);
+          if (range) out.push(range);
+        }
+        return out;
       }
 
       /** 把编号牌摆到各自 Range 的右上角。 */
@@ -825,49 +1256,127 @@
         }
       }
 
+      /** 通用矩形相交判据（用于"当前选区是否落在我们的标注上"）。 */
+      function rangesOverlap(a, b) {
+        try {
+          var ra = a.getClientRects();
+          var rb = b.getClientRects();
+          for (var i = 0; i < ra.length; i += 1) {
+            for (var j = 0; j < rb.length; j += 1) {
+              if (ra[i].left < rb[j].right && rb[j].left < ra[i].right
+                && ra[i].top < rb[j].bottom && rb[j].top < ra[i].bottom) return true;
+            }
+          }
+        } catch (error) {
+          /* 取不到矩形就当不相交 */
+        }
+        return false;
+      }
+
+      /** 挂/撤 `html[data-dsa-selgreen]` —— 让**原生选区**也涂成我们的绿。 */
+      function setSelgreen(on) {
+        try {
+          var root = document.documentElement;
+          if (!root) return;
+          if (on) root.setAttribute(SELGREEN_ATTR, "");
+          else root.removeAttribute(SELGREEN_ATTR);
+        } catch (error) {
+          /* 只是配色，失败不影响功能 */
+        }
+      }
+
+      /**
+       * 要不要把原生选区也涂成绿色。
+       *
+       * ⚠️ 这不是可选的润色，是**绕开规范限制的唯一正路**：CSSWG 已裁定
+       * `custom highlights will always go below native highlights`
+       * （csswg-drafts#4595 / css-pseudo-4 §3.6）—— 只要原生选区还在，
+       * 我们的 `::highlight()` 就一层也露不出来，用户看到的永远是浏览器的蓝。
+       *
+       * 成立条件（二选一）：
+       *  1. 待定态在（浮层开着，`pendingRange` 非空）；
+       *  2. 当前文档选区与我们**任一已画出的标注**相交
+       *     （提交之后选区往往还赖在原处，不判它就会把刚画的绿色盖住）。
+       */
+      function updateSelgreen(drawnRanges) {
+        var on = pendingRange !== null;
+        if (!on) {
+          try {
+            var sel = window.getSelection();
+            if (sel && !sel.isCollapsed && sel.rangeCount > 0) {
+              var current = sel.getRangeAt(0);
+              for (var index = 0; index < drawnRanges.length && !on; index += 1) {
+                if (rangesOverlap(current, drawnRanges[index])) on = true;
+              }
+            }
+          } catch (error) {
+            /* 判不出来就不涂 */
+          }
+        }
+        setSelgreen(on);
+      }
+
       /**
        * 重算高亮与编号牌。任何异常都吞掉 —— 标注失败绝不允许影响插件本体。
        *
-       * 两件事，判据各归各的：
+       * 三件事，判据各归各的：
        *  1. **标注** —— 只画"输入框里现存的胶囊"对应的原文（`liveChipLabels()`）。
        *     胶囊被删掉之后一条都不画，连那次全页 TreeWalker 都省掉；
-       *  2. **待定** —— 浮层开着时，用更浅的同族色把刚选中的那片接管过来。
-       *     （浏览器原生选区在浮层自动聚焦的那一刻就被清掉了，不接管就是"消失"。）
+       *  2. **待定** —— 浮层开着时，用更浅的同族色把刚选中的那片接管过来；
+       *  3. **原生选区配色** —— 见 `updateSelgreen`：不支持高亮 API 时这一条**也要跑**，
+       *     否则用户连"选中了哪一段"都看不见绿色。
        */
       function syncHighlights() {
-        if (!highlightSupported) return;
-        try {
-          var records = liveQuoteRecords(allQuoteRecords(), liveChipLabels(), chipLabel);
-          var highlight = new Highlight();
-          badgeEntries = [];
-          for (var index = 0; index < records.length; index += 1) {
-            var range = findQuoteRange(records[index].text);
-            if (!range) continue;
-            highlight.add(range);
-            badgeEntries.push({ n: records[index].n, range: range });
+        var drawnRanges = [];
+        if (highlightSupported) {
+          try {
+            var records = liveQuoteRecords(allQuoteRecords(), liveChipLabels(), chipLabel);
+            var highlight = new Highlight();
+            badgeEntries = [];
+            for (var index = 0; index < records.length; index += 1) {
+              // 一段原文可能锚成好几节（跨内联、跨段落）—— 全部加进同一条高亮
+              var ranges = findQuoteRanges(records[index].text);
+              if (ranges.length === 0) continue;
+              for (var part = 0; part < ranges.length; part += 1) {
+                highlight.add(ranges[part]);
+                drawnRanges.push(ranges[part]);
+              }
+              // 编号牌只贴第一节：号是"这一条引用"的号，不是"每一节"的号
+              badgeEntries.push({ n: records[index].n, range: ranges[0] });
+            }
+            window.CSS.highlights.set(HIGHLIGHT_KEY, highlight);
+            placeBadges();
+          } catch (error) {
+            /* 标注是锦上添花，坏了不能连累引用本身 */
           }
-          window.CSS.highlights.set(HIGHLIGHT_KEY, highlight);
-          placeBadges();
-        } catch (error) {
-          /* 标注是锦上添花，坏了不能连累引用本身 */
+          // 待定高亮**单独兜异常**：它画不出来，也绝不能让上面那层标注跟着一起没了。
+          try {
+            if (pendingRange) {
+              var pending = new Highlight();
+              pending.add(pendingRange);
+              window.CSS.highlights.set(PENDING_KEY, pending);
+            } else {
+              window.CSS.highlights.delete(PENDING_KEY);
+            }
+          } catch (error) {
+            /* 待定高亮是临时态，坏了就只是"刚选中那片没变色" */
+          }
         }
-        // 待定高亮**单独兜异常**：它画不出来，也绝不能让上面那层标注跟着一起没了。
         try {
-          if (pendingRange) {
-            var pending = new Highlight();
-            pending.add(pendingRange);
-            window.CSS.highlights.set(PENDING_KEY, pending);
-          } else {
-            window.CSS.highlights.delete(PENDING_KEY);
-          }
+          updateSelgreen(drawnRanges);
         } catch (error) {
-          /* 待定高亮是临时态，坏了就只是"刚选中那片没变色" */
+          /* 配色而已 */
         }
       }
 
       /** 节流到每帧一次：流式输出时转录一直在变，不节流会每帧跑好几遍。 */
       function scheduleHighlightSync() {
-        if (!highlightSupported || syncScheduled) return;
+        if (syncScheduled) return;
+        // 非浏览器环境（单测 harness）没有 rAF：直接同步跑一次，不排帧。
+        if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
+          syncHighlights();
+          return;
+        }
         syncScheduled = window.requestAnimationFrame(function () {
           syncScheduled = 0;
           syncHighlights();
@@ -1004,17 +1513,65 @@
           }));
         }, [selection]);
 
-        // 出现即聚焦：选中 → 直接打字，不该还要再点一下。
-        // ⚠️ 但**键盘选出来的选区不抢焦点** —— 否则按着 Shift+方向键选字时，
-        //    浮层一出现就把焦点抢走，选字当场中断（与拖拽被打断是同一类事故）。
+        /*
+         * ⚠️ 这里**故意不自动聚焦**（2026-10-16 改定，替换掉原来的"出现即聚焦"）。
+         *
+         * 原来的做法是浮层一出现就把焦点搬进批注框、好让你"选中即打字"。
+         * 但"聚焦一个 input"会让浏览器**当场清掉文档选区** —— 于是你紧接着按
+         * Ctrl+C / Ctrl+V 什么也复制不到、粘贴还落到批注框里（他实测报的）。
+         *
+         * 现在的规矩：**焦点一直留在正文，直到你第一次敲键为止**。
+         * 在那之前选区与系统快捷键都是原生的；敲下第一个可打印字符时，
+         * 下面那个 `keydown` 监听才把焦点搬进来、并把这一个字写进批注。
+         */
+        var noteRef = React.useRef(note);
+        noteRef.current = note;
+
         React.useEffect(function () {
-          var node = inputRef.current;
-          if (!node || !selection || selection.autofocus === false) return undefined;
-          var frame = window.requestAnimationFrame(function () {
-            try { node.focus({ preventScroll: true }); } catch (error) { /* 聚焦失败不影响 */ }
-          });
-          return function () { window.cancelAnimationFrame(frame); };
-        }, [selection]);
+          if (!selection) return undefined;
+          /**
+           * 全局接管"选中之后的那几下键盘"。
+           *
+           * 三条边界必须守住：
+           *  1. 焦点已经在我们浮层里 → 交给批注框自己的 onKeyDown，不重复处理；
+           *  2. 焦点在别的可编辑区（比如主输入框）→ 完全不碰，那是在编辑；
+           *  3. **带 Ctrl / Cmd / Alt 的一律放行** —— Ctrl+C / Ctrl+V / Ctrl+A…
+           *     是系统快捷键，正是这一轮要还给用户的东西。唯一例外是
+           *     `Ctrl/Cmd+Enter`（它是本插件的"提交并直发"，不是系统动作）。
+           */
+          function onGlobalKeyDown(event) {
+            if (event.defaultPrevented || event.isComposing) return;
+            var target = event.target;
+            if (target && target.closest && target.closest("[" + OWN_ATTR + "]")) return;
+            if (isExcludedNode(target)) return;
+            if (event.key === "Escape") return;      // 由插槽里那条全局 Esc 收起
+
+            if (event.ctrlKey || event.metaKey || event.altKey) {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                onCommit(selection, noteRef.current.trim(), true);
+              }
+              return;                                 // 其余系统快捷键原样放行
+            }
+            if (event.key === "Enter") {
+              if (event.shiftKey) return;
+              event.preventDefault();
+              onCommit(selection, noteRef.current.trim(), false);
+              return;
+            }
+            if (event.key.length === 1) {
+              // 可打印字符：先把焦点搬进批注框，再把这一下敲进去
+              event.preventDefault();
+              var node = inputRef.current;
+              if (node) {
+                try { node.focus({ preventScroll: true }); } catch (error) { /* 聚焦失败不影响写入 */ }
+              }
+              setNote(noteRef.current + event.key);
+            }
+          }
+          document.addEventListener("keydown", onGlobalKeyDown, true);
+          return function () { document.removeEventListener("keydown", onGlobalKeyDown, true); };
+        }, [selection, onCommit]);
 
         if (!selection) return null;
 
@@ -1098,11 +1655,19 @@
         // 修订号：插胶囊 / 插文本的 span 都要拿它做 CAS 校验，拿到旧值会被拒。
         var draftRev = useInput ? useInput(function (state) { return state.draftRev; }) : 0;
         /**
-         * 最新一版的草稿与修订号，**每次渲染都刷新**。
+         * 胶囊在输入框里的**真实占位**（剪贴板坐标下的 offset/length，宿主公布）。
+         *
+         * ⚠️ 这是插入点算得准的唯一来源（2026-10-16）：宿主 detect 投影里每个胶囊只占
+         * 1 个字符（U+FFFC），而剪贴板投影里占整段引文；`occurrences` 让我们能把
+         * 两者精确换算（见 `detectLengthOf`），不再靠猜。
+         */
+        var occurrences = useInput ? useInput(function (state) { return state.occurrences; }) : null;
+        /**
+         * 最新一版的草稿 / 修订号 / 胶囊占位，**每次渲染都刷新**。
          * 给"等胶囊落位"的那个 rAF 轮询用：它不能依赖闭包里的旧值。
          */
-        var latestRef = React.useRef({ draft: "", draftRev: 0 });
-        latestRef.current = { draft: draft, draftRev: draftRev };
+        var latestRef = React.useRef({ draft: "", draftRev: 0, occurrences: null });
+        latestRef.current = { draft: draft, draftRev: draftRev, occurrences: occurrences };
 
         /**
          * 收起浮层 —— **必须连待定高亮一起撤销**。
@@ -1119,7 +1684,7 @@
           var frame = 0;
           /** 主键是否还按着 —— 按着就是"正在拖"，这时绝不能出浮层（见 flush）。 */
           var pointerDown = false;
-          /** 这次选区是不是键盘选出来的（是的话浮层不抢焦点）。 */
+          /** 这次选区是不是键盘选出来的（键盘选区不抢焦点，免得打断 Shift+方向键选字）。 */
           var viaKeyboard = false;
           function flush() {
             frame = 0;
@@ -1138,13 +1703,12 @@
             if (pointerDown) return;
             var next = readSelection();
             if (next) {
-              // 鼠标拖出来的选区才自动聚焦；键盘选出来的不抢焦点，
-              // 否则按着 Shift+方向键选字时也会被自己的浮层打断。
-              next.autofocus = !viaKeyboard;
+              // 浮层**不抢焦点**（`Toolbar` 里那条全局键盘监听负责"第一次敲键才聚焦"）。
+              // 这样松手之后 Ctrl+C / Ctrl+V 一律是系统原生行为，作用于文档选区本身。
+              next.autofocus = false;
               setSelection(next);
-              // 松手那一刻，那片蓝色由**我们自己的待定高亮**接管 ——
-              // 浮层接下来会自动聚焦输入栏、把浏览器原生选区清掉，
-              // 有了这一层，视觉上就是"换了个颜色"，不是"选区凭空消失"。
+              // 那片选区同时交给**待定高亮**接管：等会儿焦点进了批注框、原生选区被清掉，
+              // 视觉上也只是"换了个颜色"，不是"选区凭空消失"。
               setPendingRange(next.range);
               return;
             }
@@ -1181,6 +1745,17 @@
             viaKeyboard = true;
           }
           /**
+           * 选区一变，跑两件判据各归各的事：
+           *  1. `schedule()` → `flush`：出不出 / 收不收浮层；
+           *  2. `scheduleHighlightSync()`：重算"原生选区要不要也涂成我们的绿"。
+           *     提交之后选区常常还赖在原处（工具栏的 mousedown 是 preventDefault 的，
+           *     特意保住它），不跟着选区变化重算，那个绿色标记就会停在过期状态上。
+           */
+          function onSelectionChange() {
+            schedule();
+            scheduleHighlightSync();
+          }
+          /**
            * 悬停胶囊 → 浮出原文。
            *
            * 用**事件委托**挂在 document 上，而不是挂在胶囊节点上：
@@ -1212,7 +1787,7 @@
           document.addEventListener("mouseover", onChipOver, true);
           document.addEventListener("mouseout", onChipOut, true);
           document.addEventListener("mouseup", onPointerUp, true);
-          document.addEventListener("selectionchange", schedule);
+          document.addEventListener("selectionchange", onSelectionChange);
           document.addEventListener("mousedown", onPointerDown, true);
           document.addEventListener("touchstart", onPointerDown, true);
           document.addEventListener("keydown", onKeyDown, true);
@@ -1223,7 +1798,7 @@
             document.removeEventListener("mouseover", onChipOver, true);
             document.removeEventListener("mouseout", onChipOut, true);
             document.removeEventListener("mouseup", onPointerUp, true);
-            document.removeEventListener("selectionchange", schedule);
+            document.removeEventListener("selectionchange", onSelectionChange);
             document.removeEventListener("mousedown", onPointerDown, true);
             document.removeEventListener("touchstart", onPointerDown, true);
             document.removeEventListener("keydown", onKeyDown, true);
@@ -1250,7 +1825,6 @@
           if (block === "") return;
           closeSelection();
           var editor = findEditor(anchorRef.current);
-          var record = registerQuote(picked.text);
 
           var flash = function (text) {
             setFlash({
@@ -1272,6 +1846,26 @@
               });
             }
           };
+
+          /*
+           * 登记这一条引用。四种结局，前三种**都不该再插一枚新胶囊**——
+           * 输入框里那枚（或本来就在的那枚）已经代表了它：
+           *
+           *   new      新建一条 → 下面照常插胶囊；
+           *   superset 这次选得更长、且包含已有的短句 → 把原记录**原地加长**（编号不变）；
+           *   same     文字一模一样 → 同一处标注不该有两个号；
+           *   covered  这段落在已有引用内部 → 已经被覆盖了。
+           *
+           * 带批注时不做并/覆盖判定（`allowSupersede:false`）：批注得跟着自己的胶囊走，
+           * 否则批注会和已有那枚胶囊脱节。
+           */
+          var registered = registerQuote(picked.text, { allowSupersede: note === "" });
+          var record = registered.record;
+          if (registered.action !== "new") {
+            window.requestAnimationFrame(function () { caretToEnd(editor); });
+            flash(registered.action === "superset" ? T.updated : T.covered);
+            return;
+          }
 
           /** 降级必须**出声**：这是一次看得见的行为变化，不是内部细节。 */
           var fallback = function (reason) {
@@ -1308,8 +1902,9 @@
           if (quoteMarkdown(picked.text) === block) { /* 保持 block 已被使用，免得被优化掉 */ }
 
           if (note === "") {
-            // 只有引用：直接插胶囊
-            var chipError = insertQuoteChip(record, sessionId, draft, draftRev);
+            // 只有引用：直接插胶囊（插入点 = 输入框光标处；算不出就退到末尾）
+            var plainSpot = chipInsertPosition(editor, draft, occurrences);
+            var chipError = insertQuoteChip(record, sessionId, draft, draftRev, occurrences, plainSpot.at);
             if (chipError === null) {
               window.requestAnimationFrame(function () { caretToEnd(editor); });
               flash(chipLabel(record));
@@ -1321,14 +1916,16 @@
 
           // ⚠️「引用 + 批注」的顺序很讲究：**先写批注，再把胶囊插在批注起点**。
           //
-          // 实测（2026-10-11）：胶囊一进输入框，`insert-text` 的坐标空间里就只剩
-          // 位置 0 可用 —— 胶囊在**编辑坐标**里不占长度，而 `InputState.draft` 报的是
-          // **剪贴板投影**（另一个投影，胶囊在里面展开成 clipboardText）。
-          // 所以"先插胶囊、再往它后面补文本"永远补不到它后面（试过 9、6、0 三个
-          // 候选插入点，只有 0 被接受，批注就落到了胶囊前面）。
-          // 反过来做：批注先落（此时坐标是真实文本），胶囊再插在**批注起点**
-          // ⇒ 渲染出来正是 `[胶囊] 批注`。
-          var noteAt = draft.length;
+          // 顺序为什么不能反：胶囊一进输入框，它前后的坐标就会变；先落批注（此时那一带
+          // 是普通文本、坐标干净），再把胶囊插在**批注起点** ⇒ 渲染出来正是 `[胶囊] 批注`。
+          //
+          // ⚠️ 坐标一律用 **detect 坐标**（2026-10-16 改）：
+          // 旧代码拿 `draft.length`（剪贴板长度）和一段自己写的 DOM 文本偏移去当插入点，
+          // 两者都不是宿主 `span` 要的那个空间 ⇒ 有胶囊时必被拒（批注路径长期走不通）。
+          // 现在由 `chipInsertPosition` 从 `occurrences` + DOM 光标算出真实坐标。
+          var noteSpot = chipInsertPosition(editor, draft, occurrences);
+          var noteAt = noteSpot.at;
+
           if (!insertNoteText(sessionId, " " + note + " ", noteAt, draftRev)) {
             fallback("note-text-rejected");
             return;
@@ -1337,9 +1934,9 @@
           var placeChip = function () {
             tries += 1;
             var now = latestRef.current;
-            // 位置用 `noteAt`（批注起点，插胶囊前算出来的），不是 now.draft.length ——
-            // 后者此刻已经把批注算进去了，会把胶囊插到批注后面去。
-            var error = insertQuoteChip(record, sessionId, now.draft, now.draftRev, noteAt);
+            // 位置仍用 `noteAt`（批注起点，插胶囊**之前**算出来的 *detect* 坐标）：
+            // 批注是插在这个坐标之后的，所以这个坐标本身没被推移，仍是批注的起点。
+            var error = insertQuoteChip(record, sessionId, now.draft, now.draftRev, now.occurrences, noteAt);
             if (error === null) {
               window.requestAnimationFrame(function () { caretToEnd(editor); });
               flash(chipLabel(record));
@@ -1490,24 +2087,36 @@
       /* ---------- 标注的驱动：转录一变就重算（节流到每帧一次） ---------- */
       ctx.effect(function () {
         if (!highlightSupported) {
-          // 不支持就明说一次，然后整个功能静默缺席 —— 引用本身照常工作。
-          console.warn("[" + PACKAGE_ID + "] 这个浏览器没有 CSS Custom Highlight API，原文高亮与编号不会出现。");
-          return function () {};
+          // 不支持就明说一次；`syncHighlights` 仍会跑（它还要维护 `data-dsa-selgreen`），
+          // 所以"选中哪一段"至少还能看见绿色，引用本身照常工作。
+          console.warn("[" + PACKAGE_ID + "] 这个浏览器没有 CSS Custom Highlight API，原文高亮与编号牌不会出现。");
         }
-        var observer = new MutationObserver(scheduleHighlightSync);
-        observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-        window.addEventListener("scroll", scheduleHighlightSync, true);
-        window.addEventListener("resize", scheduleHighlightSync);
+        var observer = null;
+        // 非浏览器环境（单测 harness）没有 MutationObserver / body：全部跳过。
+        if (typeof MutationObserver === "function" && typeof document !== "undefined" && document.body) {
+          observer = new MutationObserver(scheduleHighlightSync);
+          observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+        }
+        if (typeof window !== "undefined") {
+          window.addEventListener("scroll", scheduleHighlightSync, true);
+          window.addEventListener("resize", scheduleHighlightSync);
+        }
         scheduleHighlightSync();
         return function () {
-          observer.disconnect();
-          window.removeEventListener("scroll", scheduleHighlightSync, true);
-          window.removeEventListener("resize", scheduleHighlightSync);
-          if (syncScheduled) { window.cancelAnimationFrame(syncScheduled); syncScheduled = 0; }
+          if (observer) observer.disconnect();
+          if (typeof window !== "undefined") {
+            window.removeEventListener("scroll", scheduleHighlightSync, true);
+            window.removeEventListener("resize", scheduleHighlightSync);
+            if (syncScheduled && typeof window.cancelAnimationFrame === "function") {
+              window.cancelAnimationFrame(syncScheduled);
+            }
+          }
+          syncScheduled = 0;
           try { window.CSS.highlights.delete(HIGHLIGHT_KEY); } catch (error) { /* 已经没了 */ }
           try { window.CSS.highlights.delete(PENDING_KEY); } catch (error) { /* 已经没了 */ }
           badgeEntries = [];
           pendingRange = null;
+          setSelgreen(false);
           if (badgeLayer && badgeLayer.parentElement) badgeLayer.parentElement.removeChild(badgeLayer);
           badgeLayer = null;
         };
@@ -1538,6 +2147,8 @@
       quoteMarkdown: quoteMarkdown,
       composeDraft: composeDraft,
       liveQuoteRecords: liveQuoteRecords,
+      pickSupersede: pickSupersede,
+      detectLengthOf: detectLengthOf,
       isExcludedNode: isExcludedNode,
       hasOpenModal: hasOpenModal,
       clampPosition: clampPosition,

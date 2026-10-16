@@ -18,7 +18,7 @@ import { loadBundle, el } from "./harness.mjs";
  */
 const bundle = loadBundle();
 const { module, dom } = bundle;
-const { quoteMarkdown, composeDraft, liveQuoteRecords, clampPosition, pickLang, isExcludedNode, hasOpenModal, STRINGS } = module.__internals;
+const { quoteMarkdown, composeDraft, liveQuoteRecords, pickSupersede, detectLengthOf, clampPosition, pickLang, isExcludedNode, hasOpenModal, STRINGS } = module.__internals;
 
 /* ───────────────────────── 引用块 ───────────────────────── */
 
@@ -117,6 +117,66 @@ test("多个胶囊 → 全部命中，且保持登记顺序（编号牌的顺序
   assert.deepEqual(liveQuoteRecords(RECORDS, ["选中文本 1", "选中文本 1"], labelOf), [RECORDS[0]]);
 });
 
+/* ───────────────── 超集引用：选得更长时并进原来那条（2026-10-16） ───────────────── */
+
+/*
+ * 他提的 Trae 机制：同一段文字里，先引了短句、再引**包含它的长句**，
+ * 不该多出一个胶囊，而应把原来那条引用**原地加长**（编号不变）。
+ *
+ * 判据同样抽成纯函数（真实 DOM 的"是否同一区块"由 E2E 兜）。
+ */
+
+test("长句包含已引用的短句 → 并进那条（superset），不动编号", () => {
+  const short = { n: 1, text: "机器人的视觉", ref: "q1" };
+  const pick = pickSupersede([short], "我对机器人的视觉方向很感兴趣", () => true);
+  assert.equal(pick.kind, "superset");
+  assert.equal(pick.record, short);
+});
+
+test("候选有多条时取**最长**的那条（最贴近这次加长的结果）", () => {
+  const a = { n: 1, text: "视觉", ref: "q1" };
+  const b = { n: 2, text: "机器人的视觉", ref: "q2" };
+  const pick = pickSupersede([a, b], "我对机器人的视觉方向很感兴趣", () => true);
+  assert.equal(pick.kind, "superset");
+  assert.equal(pick.record, b);
+});
+
+test("文字完全相同 → same（同一处标注不该有两个号、两个胶囊）", () => {
+  const record = { n: 1, text: "同一段话", ref: "q1" };
+  assert.equal(pickSupersede([record], "同一段话", () => true).kind, "same");
+});
+
+test("新选区落在已有引用内部 → covered（已经被覆盖，不再新增）", () => {
+  const record = { n: 1, text: "我对机器人的视觉方向很感兴趣", ref: "q1" };
+  const pick = pickSupersede([record], "机器人的视觉", () => true);
+  assert.equal(pick.kind, "covered");
+  assert.equal(pick.record, record);
+});
+
+test("只是碰巧有相同字词、并不包含 → 不误并（走 new）", () => {
+  const record = { n: 1, text: "机器人的视觉", ref: "q1" };
+  assert.equal(pickSupersede([record], "机器人的听觉", () => true), null);
+  assert.equal(pickSupersede([record], "完全不相干的一句", () => true), null);
+});
+
+test("跨区块（containsFn 说不在同一处）→ 不并，走 new", () => {
+  const record = { n: 1, text: "机器人的视觉", ref: "q1" };
+  const pick = pickSupersede([record], "我对机器人的视觉方向很感兴趣", () => false);
+  assert.equal(pick, null, "跨段偶合包含不算同一处标注");
+});
+
+test("同一个字在两个区块里各出现一次 → 不误并", () => {
+  const record = { n: 1, text: "递归", ref: "q1" };
+  assert.equal(pickSupersede([record], "递归和递归", () => false), null);
+});
+
+test("空输入（没记录 / 空文本）→ null，不抛", () => {
+  assert.equal(pickSupersede([], "任意", () => true), null);
+  assert.equal(pickSupersede(null, "任意", () => true), null);
+  assert.equal(pickSupersede([{ n: 1, text: "x", ref: "q1" }], "", () => true), null);
+  assert.equal(pickSupersede([{ n: 1, text: "", ref: "q1" }], "x", () => true), null);
+});
+
 test("登记处空 / 入参不是数组 → 不抛，返回空", () => {
   assert.deepEqual(liveQuoteRecords([], [], labelOf), []);
   assert.deepEqual(liveQuoteRecords(null, [], labelOf), []);
@@ -129,6 +189,59 @@ test("返回的是新数组，不改动入参（登记处不能被挑拣逻辑�
   assert.notEqual(picked, records);
   picked.push({ n: 99, text: "注入", ref: "q99" });
   assert.equal(records.length, 1);
+});
+
+/* ───────────── detect 坐标换算（宿主 `$composerLayout` 的模型） ───────────── */
+
+/*
+ * 宿主两个投影：
+ *   · **detect** —— 每个胶囊只占 **1** 个字符（U+FFFC）；
+ *   · **剪贴板** —— 每个胶囊占它整段 `clipboardText`（`InputState.draft`）。
+ * 文本 / 换行 / 段落间隙两类投影 1:1。
+ *
+ * 所以 detect 末尾 = draft.length − Σ(occ.length) + occurrences.length。
+ *
+ * 这组用例钉住的就是 2026-10-16「连引三段变成 1,3,2」的根：旧代码按"胶囊占 0"算，
+ * 少了 +胶囊数，于是候选坐标全线落在 detect 空间之外，最后落到小整数阶梯，
+ * 而那个起点恰好落在最后一枚胶囊的 1 字符段里 ⇒ 插到了它前面。
+ */
+
+test("没有胶囊 → detect 长度就是剪贴板长度（两个投影重合）", () => {
+  assert.equal(detectLengthOf("你好世界", []), 4);
+  assert.equal(detectLengthOf("", []), 0);
+});
+
+test("一枚胶囊 → 减去整段引文、再加回 1", () => {
+  // 剪贴板：引文长度 5 + 用户文字 2 = 7；detect：1 + 2 = 3
+  assert.equal(detectLengthOf("ABCDE你好", [{ length: 5 }]), 3);
+});
+
+test("三枚胶囊 → 每枚都按 1 计入", () => {
+  // Σlen = 5+7+4 = 16；draft 长度 20、无文字 → detect = 20-16+3 = 7
+  const occ = [{ length: 5 }, { length: 7 }, { length: 4 }];
+  assert.equal(detectLengthOf("x".repeat(20), occ), 7);
+});
+
+test("多行引文（clipboardText 含换行、很长）→ detect 只占 1，差距极大", () => {
+  const quote = "> 第一行\n> 第二行\n> 第三行"; // 长度 24，其中 2 个换行
+  const occ = [{ length: quote.length }];
+  // 剪贴板 24 → detect 1
+  assert.equal(detectLengthOf(quote, occ), 1);
+  // 有用户文字时：文字照 1:1 算
+  assert.equal(detectLengthOf(quote + "追问", occ), 3);
+});
+
+test("脏输入不抛，且坐标不会变成负数", () => {
+  assert.equal(detectLengthOf(null, null), 0);
+  assert.equal(detectLengthOf(undefined, undefined), 0);
+  assert.equal(detectLengthOf("abc", null), 3);
+  assert.equal(detectLengthOf("abc", undefined), 3);
+  // 长度字段坏掉时按 0 计入 Σ（即"这枚胶囊的剪贴板占位未知"），结果只是偏大，
+  // 不会抛、也不会变成负数；宿主给的 occurrences 永远是数字，这里纯属兜底。
+  assert.equal(detectLengthOf("abc", [{ length: "不是数字" }]), 4);
+  assert.equal(detectLengthOf("abc", [{ length: -5 }]), 4);
+  // occurrences 与 draft 对不上（竞态）→ 钳到 0，绝不给宿主负坐标
+  assert.equal(detectLengthOf("ab", [{ length: 99 }]), 0);
 });
 
 /* ───────────────────────── 浮层落位 ───────────────────────── */

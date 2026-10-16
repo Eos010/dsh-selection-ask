@@ -119,7 +119,7 @@
   opacity: 1;
 }
 
-/* ── 就地输入栏（参考图4：选中后直接在原文旁边写批注） ── */
+/* ── 就地输入栏（参考图 4：选中后直接在原文旁边写批注） ── */
 
 .dsa-note {
   width: 190px;
@@ -147,7 +147,7 @@
   background: var(--dsw-alias-interactive-bg-hover, rgba(15, 17, 21, 0.06));
 }
 
-/* 图标+文字的小按钮：输入框在场时它们要更紧凑 */
+/* 图标 + 文字的小按钮：输入框在场时它们要更紧凑 */
 .dsa-btn--icon {
   padding: 0 8px;
   gap: 5px;
@@ -400,7 +400,7 @@
   filter: brightness(1.06);
 }
 
-/* ── 悬停胶囊时的原文预览（参考图3） ── */
+/* ── 悬停胶囊时的原文预览（参考图 3） ── */
 
 .dsa-chiptip {
   position: fixed;
@@ -441,32 +441,53 @@
   overflow: hidden;
 }
 
-/* ── 原文标注：高亮 + 编号（参考图1） ── */
+/* ── 原文标注：高亮 + 编号（参考图 1） ── */
 
 /*
+ * ⚠️ 绿色是硬编码的，**故意不走宿主的 brand token**：
+ *   `--dsw-alias-brand-primary` 在宿主默认主题下解析出来的是一支偏灰的中性色，
+ *   混出来的填充是"灰的"（他 2026-10-15/16 两次实测报的就是这个）；
+ *   而且用户装了别的主题皮肤后 `--dsw-alias-bg-layer-*` 一变，灰底上的灰高亮几乎看不见。
+ *   所以这里写死一支绿：任何底色上都认得出，也不受第三方皮肤影响。
+ *
  * 高亮走 CSS Custom Highlight API —— **一个字节的 DOM 都不改**。
  * 这是"稳定能用"的关键：插 <mark> 的做法会在流式输出的转录里
  * 一直和 React 打架，而高亮 API 是浏览器自己画的，React 动不到它。
  */
 ::highlight(dsh-selection-ask) {
-  background-color: color-mix(in srgb, var(--dsw-alias-brand-primary, #4a6cf7) 26%, transparent);
+  background-color: rgba(46, 194, 126, 0.32);
   color: inherit;
 }
 
 /*
  * ── 待定高亮：刚选中、浮层还开着的那一片 ──
  *
- * 为什么需要它：就地输入栏一出现就自动聚焦，而"聚焦一个 input"会让浏览器
- * **当场清掉文档选区** —— 松手之后那片蓝色就没了，看起来就是"选完就消失"。
- * 所以由这一层**接管**那一片：同族色，比"已标注"浅一档。
- * 视觉上不是消失，是**换了个颜色**。
+ * 与"已标注"同族同色、浅一档：视觉上不是消失，是**换了个颜色**。
  *
  * 同样走 CSS Custom Highlight API（DOM 一个字节都不改），且用的是**活的 Range**——
  * 只在浮层开着时存在，被重渲染打断就自动不画（它本来就是临时态）。
  */
 ::highlight(dsh-selection-ask-pending) {
-  background-color: color-mix(in srgb, var(--dsw-alias-brand-primary, #4a6cf7) 18%, transparent);
+  background-color: rgba(46, 194, 126, 0.22);
   color: inherit;
+}
+
+/*
+ * ── 原生选区也涂成我们的绿（`html[data-dsa-selgreen]`）──
+ *
+ * ⚠️ 这一条是**必须**的，不是装饰。CSSWG 已裁定：
+ *   `RESOLVED: custom highlights will always go below native highlights`
+ *   （csswg-drafts#4595；css-pseudo-4 §3.6）
+ * 也就是说 `::highlight()` **永远画在原生 `::selection` 下面**——
+ * 只要原生选区还在（我们为了保住 Ctrl+C，故意不再抢焦点清掉它），
+ * 用户看到的就是浏览器的蓝色，我们的绿**一层也露不出来**。
+ *
+ * 所以唯一正路是：把原生选区本身也涂成同一支绿。判据由 client.js 维护
+ * （待定态存在，或当前选区与我们任一标注 Range 相交时挂上该属性）。
+ * 只改背景、**不动 `color`** —— 免得破坏宿主为对比度设定的选区前景色。
+ */
+html[data-dsa-selgreen] ::selection {
+  background-color: rgba(46, 194, 126, 0.32) !important;
 }
 
 /* 编号牌：放在我们自己的浮层里，按 Range 的位置贴上去，不插进正文 */
@@ -511,5 +532,18 @@
 
   .dsa-btn:active {
     background: var(--dsw-alias-interactive-bg-active, rgba(255, 255, 255, 0.12));
+  }
+
+  /* 深色底上把绿色提亮一档，保证在深色宿主里仍然认得出 */
+  ::highlight(dsh-selection-ask) {
+    background-color: rgba(74, 222, 128, 0.30);
+  }
+
+  ::highlight(dsh-selection-ask-pending) {
+    background-color: rgba(74, 222, 128, 0.22);
+  }
+
+  html[data-dsa-selgreen] ::selection {
+    background-color: rgba(74, 222, 128, 0.30) !important;
   }
 }

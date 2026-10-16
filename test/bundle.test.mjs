@@ -194,12 +194,45 @@ test("样式优先走宿主的 styles 服务；该服务返回的 disposer 原�
   assert.equal(inserted.length, 1, "样式应恰好插入一次");
   assert.ok(inserted[0].includes(".dsa-root"), "插入的应是本插件的样式表");
   assert.ok(record.effects.some((item) => /styles/.test(item.label)), "样式应挂在 ctx.effect 上，随插件卸载回收");
-
   // 全部 effect 的 disposer 都必须是函数、且调用不抛
   for (const effect of record.effects) {
     if (effect.disposer) assert.doesNotThrow(() => effect.disposer());
   }
   assert.equal(disposed, 1, "styles 服务的 disposer 应该被调用一次");
+});
+
+/*
+ * 配色是设计决策，不是随手填的值 —— 它被两次实测报过"太灰/还是蓝"，
+ * 所以在这里钉住三条，防止以后被"顺手改成品牌色"改回去：
+ *  1. 两态（待定 / 已标注）都用**硬编码的绿**，**不许**再回到 `--dsw-alias-brand-primary`
+ *     （宿主默认主题下它解析成偏灰的中性色，混出来就是"灰的"）；
+ *  2. `html[data-dsa-selgreen] ::selection` 这条必须在 —— 它是绕开
+ *     "自定义高亮永远画在原生选区之下"（csswg-drafts#4595）的唯一正路；
+ *  3. 背景色不能完全没有不透明度（否则画了也白画）。
+ */
+test("配色：两态都是硬编码的绿，且带让原生选区也变绿的规则", () => {
+  const { module } = loadBundle();
+  const inserted = [];
+  const { ctx } = createContext({
+    services: { styles: { insert(css) { inserted.push(css); return () => {}; } } }
+  });
+  module.apply(ctx);
+  const css = inserted[0];
+
+  const annotated = css.match(/::highlight\(dsh-selection-ask\)\s*\{([^}]*)\}/);
+  const pending = css.match(/::highlight\(dsh-selection-ask-pending\)\s*\{([^}]*)\}/);
+  assert.ok(annotated, "应存在已标注高亮的 ::highlight 规则");
+  assert.ok(pending, "应存在待定高亮的 ::highlight 规则");
+  assert.ok(/rgba\(\s*46\s*,\s*194\s*,\s*126/.test(annotated[1]), "已标注那层应是绿色");
+  assert.ok(/rgba\(\s*46\s*,\s*194\s*,\s*126/.test(pending[1]), "待定那层应是绿色");
+  assert.ok(
+    !/brand-primary/.test(annotated[1]),
+    "已标注那层不许再走品牌色 token —— 它在宿主默认主题下是灰的"
+  );
+  assert.ok(
+    /html\[data-dsa-selgreen\]\s*::selection/.test(css),
+    "必须有 `html[data-dsa-selgreen] ::selection` —— 否则原生选区会盖住绿色"
+  );
 });
 
 test("拿不到 styles 服务时退回自插 <style>，并且卸载时移除它", () => {
