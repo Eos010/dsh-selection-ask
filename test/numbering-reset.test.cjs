@@ -1,4 +1,12 @@
-/* 验证 BUG 1 修复：引用编号自动重置 */
+/*
+ * 引用编号的重置规则（源码级回归）。
+ *
+ * 规则本身是产品行为，写在 README 的「编号的粒度」一节：编号在一个页面生命周期内
+ * 递增、同一段文字复用原号；把输入框里的胶囊全删掉之后，下一轮从 1 重新开始。
+ *
+ * 这里用最轻的方式守住它：把源码里的占位符换成一段 CSS、当成模块编译一次，
+ * 再按规则检查那几处判据还在。
+ */
 const fs = require("fs");
 const path = require("path");
 const Module = require("module");
@@ -93,8 +101,8 @@ try {
 }
 
 if (failed === 0) {
-  console.log("\nBUG1 fix verification: PASS");
+  console.log("\n编号重置规则: PASS");
 } else {
-  console.log("\nBUG1 fix verification: FAIL (" + failed + ")");
+  console.log("\n编号重置规则: FAIL (" + failed + ")");
   process.exit(1);
 }
